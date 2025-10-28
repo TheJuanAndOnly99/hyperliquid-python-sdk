@@ -62,7 +62,7 @@ def send_notification(title: str, message: str, sound: str = "default"):
 
 
 class CopyTrader:
-    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True, telegram_config: dict = None):
+    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True, telegram_config: dict = None, use_isolated_margin: bool = True):
         """
         Initialize the copy trader.
         
@@ -73,10 +73,12 @@ class CopyTrader:
             max_leverage: Maximum leverage to use (default: 10x like target wallet)
             enable_notifications: Send macOS notifications on trades (default: True)
             telegram_config: Dict with 'bot_token' and 'chat_id' for Telegram notifications
+            use_isolated_margin: Use isolated margin instead of cross margin (default: True)
         """
         self.target_wallet = target_wallet.lower()
         self.max_leverage = max_leverage
         self.enable_notifications = enable_notifications
+        self.use_isolated_margin = use_isolated_margin
         
         # Setup Telegram notifier if configured
         self.telegram = None
@@ -119,6 +121,16 @@ class CopyTrader:
         print(f"   Target: ${target_value:,.2f}")
         print(f"   Yours:  ${my_value:,.2f}")
         
+        # Print margin mode
+        margin_mode = "ISOLATED" if self.use_isolated_margin else "CROSS"
+        print(f"\n🔧 Margin Mode: {margin_mode}")
+        if self.use_isolated_margin:
+            print(f"   Using isolated margin with {self.max_leverage}x leverage")
+            print(f"   Each position will have dedicated margin allocated")
+        else:
+            print(f"   Using cross margin with {self.max_leverage}x leverage")
+            print(f"   All positions share the same margin pool")
+        
         # Calculate copy percentage
         if auto_calculate and copy_percentage is None:
             if my_value > 0 and target_value > 0:
@@ -144,6 +156,8 @@ class CopyTrader:
         print(f"   3. Target is using ~10x leverage (very high risk)")
         print(f"   4. Price slippage may affect your execution")
         print(f"   5. You will be copying both wins AND losses")
+        if self.use_isolated_margin:
+            print(f"   6. Using isolated margin: each position is isolated and funded separately")
         print(f"\n{'='*80}\n")
         
         # Send startup notifications
@@ -351,6 +365,36 @@ class CopyTrader:
             if current_price > 0:
                 trade_value = copy_size * current_price
                 print(f"   Estimated value: ${trade_value:,.2f}")
+            
+            # Configure isolated margin if enabled
+            if self.use_isolated_margin:
+                print(f"   Setting isolated margin mode for {coin}...")
+                # Set leverage to isolated mode (is_cross=False means isolated)
+                try:
+                    leverage_result = self.exchange.update_leverage(self.max_leverage, coin, is_cross=False)
+                    if leverage_result.get("status") == "ok":
+                        print(f"   ✅ Leverage set to {self.max_leverage}x (isolated)")
+                    else:
+                        logging.warning(f"Could not set leverage for {coin}: {leverage_result}")
+                except Exception as e:
+                    logging.warning(f"Error setting leverage for {coin}: {e}")
+                
+                # Calculate and add isolated margin for the position
+                if current_price > 0 and trade_value > 0:
+                    # For isolated margin, we need to fund the position
+                    # The margin needed = position value / leverage
+                    required_margin = trade_value / self.max_leverage
+                    # Add a 10% buffer for safety
+                    margin_to_add = required_margin * 1.1
+                    
+                    try:
+                        margin_result = self.exchange.update_isolated_margin(margin_to_add, coin)
+                        if margin_result.get("status") == "ok":
+                            print(f"   ✅ Added ${margin_to_add:,.2f} isolated margin")
+                        else:
+                            logging.warning(f"Could not add isolated margin for {coin}: {margin_result}")
+                    except Exception as e:
+                        logging.warning(f"Error adding isolated margin for {coin}: {e}")
             
             # Place market order (automatic - no confirmation needed)
             result = self.exchange.market_open(
@@ -646,6 +690,11 @@ def main():
     # False = Don't check positions on startup
     SYNC_ON_STARTUP = True
     
+    # Use isolated margin instead of cross margin
+    # True  = Use isolated margin (each position has dedicated margin)
+    # False = Use cross margin (all positions share margin pool)
+    USE_ISOLATED_MARGIN = True
+    
     # ==========================
     
     # Setup Telegram config
@@ -663,7 +712,8 @@ def main():
         copy_percentage=COPY_PERCENTAGE,
         max_leverage=10,
         enable_notifications=ENABLE_NOTIFICATIONS,
-        telegram_config=telegram_config
+        telegram_config=telegram_config,
+        use_isolated_margin=USE_ISOLATED_MARGIN
     )
     
     # Set whether to copy existing positions
