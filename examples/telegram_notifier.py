@@ -75,7 +75,7 @@ Bot will copy this trade...
 """
         self.send_message(message)
     
-    def notify_trade_executed(self, coin: str, direction: str, size: float, value: Optional[float] = None):
+    def notify_trade_executed(self, coin: str, direction: str, size: float, value: Optional[float] = None, price: float = 0):
         """Notify when your trade executes successfully."""
         message = f"""
 ✅ <b>Trade Executed Successfully</b>
@@ -84,8 +84,10 @@ Coin: <b>{coin}</b>
 Direction: {direction}
 Size: {size:.6f}
 """
+        if price > 0:
+            message += f"Price: <code>${price:,.2f}</code>\n"
         if value:
-            message += f"Value: ${value:,.2f}"
+            message += f"Value: <code>${value:,.2f}</code>"
         
         self.send_message(message)
     

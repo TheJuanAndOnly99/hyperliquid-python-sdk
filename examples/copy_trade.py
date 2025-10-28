@@ -330,22 +330,27 @@ class CopyTrader:
                     sound="Glass"
                 )
             
+            # Get current price
+            current_price = 0
+            try:
+                coin_data = self.info.name_to_coin[coin]
+                mids = self.info.all_mids()
+                current_price = float(mids.get(coin_data, 0))
+            except:
+                pass
+            
             print(f"\n📊 Position change detected for {coin}:")
             print(f"   Previous size: {prev_size}")
             print(f"   Current size:  {current_size}")
             print(f"   Change: {size_diff:+.6f}")
             print(f"   Copy size: {copy_size} ({self.copy_percentage * 100}% of change)")
             print(f"   Direction: {'BUY' if is_buy else 'SELL'}")
+            print(f"   Price @ detection: ${current_price:,.2f}")
             
-            # Get current price to estimate trade value
-            try:
-                coin_data = self.info.name_to_coin[coin]
-                mids = self.info.all_mids()
-                current_price = float(mids.get(coin_data, 0))
+            # Calculate trade value
+            if current_price > 0:
                 trade_value = copy_size * current_price
                 print(f"   Estimated value: ${trade_value:,.2f}")
-            except:
-                pass
             
             # Place market order (automatic - no confirmation needed)
             result = self.exchange.market_open(
@@ -356,19 +361,33 @@ class CopyTrader:
             )
             
             if result.get("status") == "ok":
-                print(f"   ✅ Order placed successfully!")
-                print(f"   Status: {json.dumps(result, indent=2)}")
+                # Get executed price from result
+                executed_price = current_price
+                try:
+                    if "response" in result and "data" in result["response"]:
+                        # Try to get executed price from response
+                        data = result["response"]["data"]
+                        if "statuses" in data and len(data["statuses"]) > 0:
+                            if "filled" in data["statuses"][0]:
+                                filled_data = data["statuses"][0]["filled"]
+                                if "totalSz" in filled_data and "avgPx" in filled_data:
+                                    executed_price = float(filled_data["avgPx"])
+                except:
+                    pass
                 
-                trade_value = copy_size * current_price if 'current_price' in locals() else 0
+                print(f"   ✅ Order placed successfully!")
+                print(f"   Price @ execution: ${executed_price:,.2f}")
+                
+                trade_value = copy_size * executed_price
                 
                 # Send success notifications
                 if self.telegram:
-                    self.telegram.notify_trade_executed(coin, "BUY" if is_buy else "SELL", copy_size, trade_value)
+                    self.telegram.notify_trade_executed(coin, "BUY" if is_buy else "SELL", copy_size, trade_value, executed_price)
                 
                 if self.enable_notifications:
                     send_notification(
                         title=f"✅ Trade Executed: {coin} {'BUY' if is_buy else 'SELL'}",
-                        message=f"Size: {copy_size:.4f} | Value: ~${trade_value:,.2f}",
+                        message=f"Size: {copy_size:.4f} @ ${executed_price:,.2f} | Value: ~${trade_value:,.2f}",
                         sound="Purr"
                     )
             else:
@@ -422,27 +441,83 @@ class CopyTrader:
             if abs(current_size - prev_size) > 0.01:
                 self.place_copy_order(coin, current_size, prev_size)
         
-        # Handle positions that were closed
+        # Handle positions that were closed or reduced
         for coin in self.last_positions:
+            prev_size = float(self.last_positions[coin].get("szi", 0))
+            
             if coin not in current_positions:
-                # Position was closed, close ours too
+                # Position was completely closed, close ours too
                 try:
-                    # Send notifications
-                    if self.telegram:
-                        self.telegram.notify_position_closed(coin)
+                    # Calculate how much of our position to close (proportional to target)
+                    my_positions = self.get_my_positions()
+                    my_position_size = my_positions.get(coin, 0)
                     
-                    if self.enable_notifications:
-                        send_notification(
-                            title=f"🔔 Position Closed: {coin}",
-                            message="Target closed position. Closing yours too...",
-                            sound="Glass"
-                        )
-                    
-                    print(f"\n📊 Position closed for {coin}")
-                    self.exchange.market_close(coin)
-                    print(f"   ✅ Closed position in {coin}")
+                    if abs(my_position_size) > 0.001:  # We have a position to close
+                        print(f"\n📊 Target closed position for {coin}")
+                        print(f"   Target had: {prev_size:+.4f}")
+                        print(f"   Your position: {my_position_size:+.4f}")
+                        print(f"   Closing entire position...")
+                        
+                        # Send notifications
+                        if self.telegram:
+                            self.telegram.notify_position_closed(coin)
+                        
+                        if self.enable_notifications:
+                            send_notification(
+                                title=f"🔔 Position Closed: {coin}",
+                                message=f"Target closed {abs(prev_size):.4f}. Closing yours...",
+                                sound="Glass"
+                            )
+                        
+                        self.exchange.market_close(coin)
+                        print(f"   ✅ Closed position in {coin}")
                 except Exception as e:
                     print(f"   ❌ Error closing position: {e}")
+            else:
+                # Position changed (not closed completely)
+                current_size = float(current_positions[coin].get("szi", 0))
+                
+                # Calculate size change
+                size_diff = current_size - prev_size
+                
+                if abs(size_diff) > 0.01:
+                    # This will be handled by place_copy_order above
+                    # But if it's a reduction, we need to close our proportional amount
+                    if (size_diff < 0 and prev_size > 0) or (size_diff > 0 and prev_size < 0):
+                        # Position is being reduced/closed partially
+                        close_amount = abs(size_diff) * self.copy_percentage
+                        my_positions = self.get_my_positions()
+                        my_position_size = my_positions.get(coin, 0)
+                        
+                        # Only close if we have a position
+                        if abs(my_position_size) > 0.001:
+                            # Determine how much to close
+                            direction = my_position_size < 0  # True if short, False if long
+                            
+                            # Round close amount appropriately
+                            if coin in ["BTC", "ETH"]:
+                                close_amount = round(close_amount, 4)
+                            elif coin == "SOL":
+                                close_amount = round(close_amount, 2)
+                            else:
+                                close_amount = round(close_amount, 2)
+                            
+                            if abs(close_amount) > 0.001:
+                                print(f"\n📊 Target reduced position for {coin}")
+                                print(f"   Target reduced by: {abs(size_diff):.4f}")
+                                print(f"   Closing your position by: {close_amount:.4f}")
+                                
+                                # Close using market_close with specific size and opposite direction
+                                # We need to close in the direction opposite to our position
+                                is_buy = not (my_position_size > 0)  # If long, we buy to close, if short we need to...
+                                
+                                # Actually, let's use the exchange method properly
+                                result = self.exchange.market_close(coin, sz=close_amount)
+                                
+                                if result.get("status") == "ok":
+                                    print(f"   ✅ Reduced position by {close_amount:.4f}")
+                                else:
+                                    print(f"   ❌ Failed to reduce position: {result}")
         
         # Update last known positions
         self.last_positions = current_positions
@@ -536,7 +611,12 @@ def main():
     COPY_PERCENTAGE = None  # Set to a value like 0.01 for 1% if you want manual control
     
     # Check interval in seconds
-    CHECK_INTERVAL = 10  # Check every 10 seconds
+    # Lower values = faster response time but more API requests
+    # Rate limit: 1,200 requests/minute per IP (about 20 requests/second)
+    # Recommended: 5 seconds = ~12 requests/minute per target wallet
+    # Minimum safe: 3 seconds = ~20 requests/minute per target wallet
+    # You can run multiple targets if staying under rate limits
+    CHECK_INTERVAL = 3  # Check every 5 seconds (safe for quick response)
     
     # ==========================
     
