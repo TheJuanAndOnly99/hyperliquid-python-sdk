@@ -187,6 +187,89 @@ class CopyTrader:
             logging.warning(f"Error fetching my positions: {e}")
             return {}
     
+    def sync_positions_on_startup(self):
+        """
+        Sync positions on startup to ensure we're aligned with the target.
+        This handles the case where the bot restarts and needs to sync up with existing positions.
+        """
+        print("\n" + "="*80)
+        print("🔄 SYNCING POSITIONS ON STARTUP")
+        print("="*80)
+        
+        # Get target's current positions
+        target_positions = self.get_current_positions()
+        
+        # Get my current positions
+        my_positions = self.get_my_positions()
+        
+        if not target_positions:
+            print("   Target has no open positions.")
+            # Close any positions we have if target has none
+            if my_positions:
+                print(f"   Closing {len(my_positions)} positions to match target...")
+                for coin, size in my_positions.items():
+                    try:
+                        print(f"   Closing {coin} position: {size}")
+                        self.exchange.market_close(coin)
+                    except Exception as e:
+                        logging.warning(f"Could not close {coin}: {e}")
+            print("   ✅ Synced - no positions")
+            return
+        
+        print(f"\n   Target has {len(target_positions)} positions:")
+        print(f"   You have {len(my_positions)} positions:")
+        print()
+        
+        # Check if we need to sync
+        needs_sync = False
+        
+        # Check target's positions
+        for coin, position in target_positions.items():
+            target_size = float(position.get("szi", 0))
+            expected_size = target_size * self.copy_percentage
+            my_size = my_positions.get(coin, 0)
+            
+            target_direction = "long" if target_size > 0 else "short"
+            my_direction = "long" if my_size > 0 else "short"
+            
+            size_diff = abs(expected_size - my_size)
+            
+            print(f"   {coin}:")
+            print(f"      Target: {target_size:+.4f} ({target_direction})")
+            print(f"      Expected: {expected_size:+.4f}")
+            print(f"      Your current: {my_size:+.4f} ({my_direction})")
+            
+            # If direction is wrong or size is off by more than 5%, we need to sync
+            if abs(size_diff) > abs(expected_size * 0.05):
+                print(f"      ⚠️  Needs sync (diff: {size_diff:+.4f})")
+                needs_sync = True
+            else:
+                print(f"      ✅ In sync")
+        
+        # Check for positions you have that target doesn't
+        for coin in my_positions:
+            if coin not in target_positions:
+                print(f"   {coin}: You have {my_positions[coin]} but target doesn't")
+                print(f"      ⚠️  Needs to close")
+                needs_sync = True
+        
+        print()
+        
+        if not needs_sync:
+            print("   ✅ All positions already in sync!")
+            print("   No sync needed.")
+        else:
+            print("   ⚠️  POSITIONS OUT OF SYNC")
+            print("   This can happen if:")
+            print("   • Bot was stopped/restarted")
+            print("   • You manually traded")
+            print("   • Network issues during trading")
+            print()
+            print("   The bot will continue monitoring - sync will happen gradually")
+            print("   or you can manually adjust positions now.")
+        
+        print("="*80 + "\n")
+    
     def place_copy_order(self, coin: str, current_size: float, prev_size: float):
         """
         Place an order to match the target's position change.
@@ -264,16 +347,7 @@ class CopyTrader:
             except:
                 pass
             
-            # Ask for confirmation (optional - you can remove this for fully automatic trading)
-            user_input = input("\n⚠️  Execute this trade? (y/n/q for quit): ").lower().strip()
-            if user_input in ['n', 'no']:
-                print("   ⏭️  Trade skipped by user")
-                return
-            if user_input in ['q', 'quit']:
-                print("\n🛑 Stopping copy trading by user request")
-                return
-            
-            # Place market order
+            # Place market order (automatic - no confirmation needed)
             result = self.exchange.market_open(
                 coin, 
                 is_buy=is_buy, 
@@ -384,13 +458,18 @@ class CopyTrader:
         else:
             print("   No open positions")
     
-    def start_monitoring(self, interval: int = 5):
+    def start_monitoring(self, interval: int = 5, sync_on_startup: bool = True):
         """
         Start monitoring the target wallet.
         
         Args:
             interval: Check interval in seconds (default: 5)
+            sync_on_startup: Check and sync positions on startup (default: True)
         """
+        # Sync positions on startup if enabled
+        if sync_on_startup:
+            self.sync_positions_on_startup()
+        
         logging.info(f"\n🔄 Starting continuous monitoring...")
         logging.info(f"   Checking every {interval} seconds")
         logging.info("   Press Ctrl+C to stop\n")
@@ -482,6 +561,11 @@ def main():
     # False = Skip existing positions, only copy NEW trades
     COPY_EXISTING_POSITIONS = False
     
+    # Sync positions on startup - ensures bot aligns with target after restart
+    # True  = Check if positions are aligned and report
+    # False = Don't check positions on startup
+    SYNC_ON_STARTUP = True
+    
     # ==========================
     
     # Setup Telegram config
@@ -505,8 +589,8 @@ def main():
     # Set whether to copy existing positions
     trader.copy_existing_positions = COPY_EXISTING_POSITIONS
     
-    # Start monitoring
-    trader.start_monitoring(interval=CHECK_INTERVAL)
+    # Start monitoring with sync enabled
+    trader.start_monitoring(interval=CHECK_INTERVAL, sync_on_startup=SYNC_ON_STARTUP)
 
 
 if __name__ == "__main__":
