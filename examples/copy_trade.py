@@ -443,12 +443,18 @@ def main():
     # Enable macOS notifications (set to False to disable)
     ENABLE_NOTIFICATIONS = True
     
-    # Enable Telegram notifications
-    # Get your bot token from @BotFather on Telegram
-    # Get your chat ID by sending a message to your bot and running: python examples/telegram_notifier.py <your_bot_token>
-    ENABLE_TELEGRAM = True
-    TELEGRAM_BOT_TOKEN = "8328145442:AAEy4ZMZgMnG4SMs5Pccnn9tsQgpkMzj_II"  # Your bot token from @BotFather
-    TELEGRAM_CHAT_ID = "2026256554"    # Your chat ID
+    # Enable Telegram notifications - loaded from config.json
+    # Add your bot token to examples/config.json under "telegram" section
+    import json
+    import os
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    with open(config_path) as f:
+        telegram_config_data = json.load(f)
+    
+    telegram_settings = telegram_config_data.get("telegram", {})
+    TELEGRAM_BOT_TOKEN = telegram_settings.get("bot_token")
+    TELEGRAM_CHAT_ID = telegram_settings.get("chat_id", "2026256554")
+    ENABLE_TELEGRAM = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
     
     # Copy existing positions on startup (True) or only future trades (False)
     # True  = Copy all existing positions when bot starts
