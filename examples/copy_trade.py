@@ -201,6 +201,35 @@ class CopyTrader:
             logging.warning(f"Error fetching my positions: {e}")
             return {}
     
+    def adjust_copy_percentage(self):
+        """
+        Dynamically adjust copy percentage based on current account values.
+        This ensures we maintain relative position sizing as account values change.
+        """
+        try:
+            my_state = self.info.user_state(self.address)
+            target_state = self.info.user_state(self.target_wallet)
+            
+            my_value = float(my_state.get("marginSummary", {}).get("accountValue", "0"))
+            target_value = float(target_state.get("marginSummary", {}).get("accountValue", "0"))
+            
+            if my_value > 0 and target_value > 0:
+                new_copy_percentage = min(my_value / target_value, 1.0)  # Don't go over 100%
+                
+                # Only log if there's a significant change (more than 1%)
+                change = abs(new_copy_percentage - self.copy_percentage)
+                if change > 0.01:
+                    old_pct = self.copy_percentage * 100
+                    new_pct = new_copy_percentage * 100
+                    logging.info(f"📊 Adjusting copy percentage: {old_pct:.2f}% → {new_pct:.2f}% "
+                                f"(Your value: ${my_value:,.2f}, Target: ${target_value:,.2f})")
+                
+                self.copy_percentage = new_copy_percentage
+            else:
+                logging.warning("Could not adjust copy percentage: invalid account values")
+        except Exception as e:
+            logging.warning(f"Error adjusting copy percentage: {e}")
+    
     def sync_positions_on_startup(self):
         """
         Sync positions on startup to ensure we're aligned with the target.
@@ -434,6 +463,9 @@ class CopyTrader:
                         message=f"Size: {copy_size:.4f} @ ${executed_price:,.2f} | Value: ~${trade_value:,.2f}",
                         sound="Purr"
                     )
+                
+                # Adjust copy percentage after successful trade
+                self.adjust_copy_percentage()
             else:
                 print(f"   ❌ Order failed: {result.get('response')}")
                 
@@ -513,8 +545,12 @@ class CopyTrader:
                                 sound="Glass"
                             )
                         
-                        self.exchange.market_close(coin)
+                        close_result = self.exchange.market_close(coin)
                         print(f"   ✅ Closed position in {coin}")
+                        
+                        # Adjust copy percentage after closing position
+                        if close_result.get("status") == "ok":
+                            self.adjust_copy_percentage()
                 except Exception as e:
                     print(f"   ❌ Error closing position: {e}")
             else:
@@ -560,6 +596,8 @@ class CopyTrader:
                                 
                                 if result.get("status") == "ok":
                                     print(f"   ✅ Reduced position by {close_amount:.4f}")
+                                    # Adjust copy percentage after reducing position
+                                    self.adjust_copy_percentage()
                                 else:
                                     print(f"   ❌ Failed to reduce position: {result}")
         
