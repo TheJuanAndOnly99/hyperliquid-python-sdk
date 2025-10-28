@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Label: Unique identifier for the service -->
+    <key>Label</key>
+    <string>com.hyperliquid.copytrader</string>
+    
+    <!-- Program: Path to the wrapper script -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/juan/Desktop/hyperliquid-python-sdk/examples/run_copy_trader.sh</string>
+    </array>
+    
+    <!-- Run at load: Start the service when it's loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <!-- Keep alive: Restart automatically if it crashes -->
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart on successful exit (crashes) -->
+        <key>Crashed</key>
+        <true/>
+        <!-- Don't restart if process exits successfully -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/juan/Desktop/hyperliquid-python-sdk/examples</string>
+    
+    <!-- Standard output file -->
+    <key>StandardOutPath</key>
+    <string>/Users/juan/Desktop/hyperliquid-python-sdk/examples/logs/service_output.log</string>
+    
+    <!-- Standard error file -->
+    <key>StandardErrorPath</key>
+    <string>/Users/juan/Desktop/hyperliquid-python-sdk/examples/logs/service_error.log</string>
+    
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/juan/.local/bin</string>
+    </dict>
+    
+    <!-- Throttle interval: Wait 60 seconds before restarting -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>
+

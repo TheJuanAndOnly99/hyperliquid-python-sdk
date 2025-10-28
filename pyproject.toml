@@ -60,6 +60,12 @@ vcrpy = { version = "^7.0.0", python = "3.10.10" }
 types-requests = "^2.31.0"
 lz4 = "^4.3"
 
+
+[[tool.poetry.source]]
+name = "safety"
+url = "https://pkgs.safetycli.com/repository/session/pypi/simple/"
+priority = "primary"
+
 [tool.black]
 line-length = 120
 
