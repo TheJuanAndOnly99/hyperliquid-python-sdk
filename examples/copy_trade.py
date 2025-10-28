@@ -156,6 +156,8 @@ class CopyTrader:
                 message=f"Tracking wallet {target_wallet[:10]}... | Copying {self.copy_percentage * 100:.2f}%",
                 sound="default"
             )
+        
+        self._startup_notified = True
     
     def get_current_positions(self) -> Dict[str, Dict]:
         """Get current positions for the target wallet."""
@@ -416,9 +418,28 @@ class CopyTrader:
                 
         except KeyboardInterrupt:
             logging.info("\n\n🛑 Monitoring stopped by user")
+            self._notify_shutdown("User stopped")
         except Exception as e:
             logging.critical(f"Fatal error: {e}")
+            self._notify_shutdown(f"Error: {e}")
             raise
+    
+    def _notify_shutdown(self, reason: str):
+        """Notify when bot stops."""
+        try:
+            if self.telegram:
+                self.telegram.send_message(
+                    f"🛑 <b>Copy Trading Bot Stopped</b>\n\nReason: <code>{reason}</code>\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            
+            if self.enable_notifications:
+                send_notification(
+                    title="🛑 Bot Stopped",
+                    message=reason,
+                    sound="Basso"
+                )
+        except Exception as e:
+            logging.warning(f"Could not send shutdown notification: {e}")
 
 
 def main():
