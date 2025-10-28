@@ -18,6 +18,14 @@ import example_utils
 
 from hyperliquid.utils import constants
 
+# Try importing Telegram notifier (optional)
+try:
+    from telegram_notifier import TelegramNotifier
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+    TelegramNotifier = None
+
 # Configure logging
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
 logging.basicConfig(
@@ -54,7 +62,7 @@ def send_notification(title: str, message: str, sound: str = "default"):
 
 
 class CopyTrader:
-    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True):
+    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True, telegram_config: dict = None):
         """
         Initialize the copy trader.
         
@@ -64,10 +72,23 @@ class CopyTrader:
             auto_calculate: If True, automatically calculate copy percentage based on account values
             max_leverage: Maximum leverage to use (default: 10x like target wallet)
             enable_notifications: Send macOS notifications on trades (default: True)
+            telegram_config: Dict with 'bot_token' and 'chat_id' for Telegram notifications
         """
         self.target_wallet = target_wallet.lower()
         self.max_leverage = max_leverage
         self.enable_notifications = enable_notifications
+        
+        # Setup Telegram notifier if configured
+        self.telegram = None
+        if telegram_config and TELEGRAM_AVAILABLE:
+            try:
+                self.telegram = TelegramNotifier(
+                    telegram_config.get("bot_token"),
+                    telegram_config.get("chat_id")
+                )
+                logging.info("✅ Telegram notifications enabled")
+            except Exception as e:
+                logging.warning(f"⚠️ Could not initialize Telegram: {e}")
         
         # Track known fills to avoid duplicate execution
         self.known_fills: Set[str] = set()
@@ -125,7 +146,10 @@ class CopyTrader:
         print(f"   5. You will be copying both wins AND losses")
         print(f"\n{'='*80}\n")
         
-        # Send startup notification
+        # Send startup notifications
+        if self.telegram:
+            self.telegram.notify_startup(target_wallet, self.copy_percentage)
+        
         if self.enable_notifications:
             send_notification(
                 title="🚀 Copy Trading Active",
@@ -211,6 +235,9 @@ class CopyTrader:
             action = "BOUGHT" if is_buy else "SOLD"
             size_text = f"{abs(size_diff):+.4f}"
             
+            if self.telegram:
+                self.telegram.notify_target_trade(coin, action, size_diff, "BUY" if is_buy else "SELL")
+            
             if self.enable_notifications:
                 send_notification(
                     title=f"🎯 Target Wallet: {coin} {action}",
@@ -256,21 +283,31 @@ class CopyTrader:
                 print(f"   ✅ Order placed successfully!")
                 print(f"   Status: {json.dumps(result, indent=2)}")
                 
-                # Send success notification
+                trade_value = copy_size * current_price if 'current_price' in locals() else 0
+                
+                # Send success notifications
+                if self.telegram:
+                    self.telegram.notify_trade_executed(coin, "BUY" if is_buy else "SELL", copy_size, trade_value)
+                
                 if self.enable_notifications:
                     send_notification(
                         title=f"✅ Trade Executed: {coin} {'BUY' if is_buy else 'SELL'}",
-                        message=f"Size: {copy_size:.4f} | Value: ~${copy_size * current_price if 'current_price' in locals() else 0:,.2f}",
+                        message=f"Size: {copy_size:.4f} | Value: ~${trade_value:,.2f}",
                         sound="Purr"
                     )
             else:
                 print(f"   ❌ Order failed: {result.get('response')}")
                 
-                # Send failure notification
+                error_msg = result.get('response', 'Unknown error')
+                
+                # Send failure notifications
+                if self.telegram:
+                    self.telegram.notify_trade_failed(coin, "BUY" if is_buy else "SELL", error_msg)
+                
                 if self.enable_notifications:
                     send_notification(
                         title=f"❌ Trade Failed: {coin} {'BUY' if is_buy else 'SELL'}",
-                        message=f"Error: {result.get('response', 'Unknown error')}",
+                        message=f"Error: {error_msg}",
                         sound="Basso"
                     )
                 
@@ -314,7 +351,10 @@ class CopyTrader:
             if coin not in current_positions:
                 # Position was closed, close ours too
                 try:
-                    # Send notification
+                    # Send notifications
+                    if self.telegram:
+                        self.telegram.notify_position_closed(coin)
+                    
                     if self.enable_notifications:
                         send_notification(
                             title=f"🔔 Position Closed: {coin}",
@@ -400,8 +440,15 @@ def main():
     
     # ==========================
     
-    # Enable notifications (set to False to disable)
+    # Enable macOS notifications (set to False to disable)
     ENABLE_NOTIFICATIONS = True
+    
+    # Enable Telegram notifications
+    # Get your bot token from @BotFather on Telegram
+    # Get your chat ID by sending a message to your bot and running: python examples/telegram_notifier.py <your_bot_token>
+    ENABLE_TELEGRAM = True
+    TELEGRAM_BOT_TOKEN = "8328145442:AAEy4ZMZgMnG4SMs5Pccnn9tsQgpkMzj_II"  # Your bot token from @BotFather
+    TELEGRAM_CHAT_ID = "2026256554"    # Your chat ID
     
     # Copy existing positions on startup (True) or only future trades (False)
     # True  = Copy all existing positions when bot starts
@@ -410,13 +457,22 @@ def main():
     
     # ==========================
     
+    # Setup Telegram config
+    telegram_config = None
+    if ENABLE_TELEGRAM and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        telegram_config = {
+            "bot_token": TELEGRAM_BOT_TOKEN,
+            "chat_id": TELEGRAM_CHAT_ID
+        }
+    
     # Create and start the copy trader
     trader = CopyTrader(
         target_wallet=TARGET_WALLET,
         auto_calculate=AUTO_CALCULATE,
         copy_percentage=COPY_PERCENTAGE,
         max_leverage=10,
-        enable_notifications=ENABLE_NOTIFICATIONS
+        enable_notifications=ENABLE_NOTIFICATIONS,
+        telegram_config=telegram_config
     )
     
     # Set whether to copy existing positions
