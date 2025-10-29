@@ -345,15 +345,12 @@ class CopyTrader:
         copy_size = abs(size_diff) * self.copy_percentage
         is_buy = size_diff > 0
         
-        # Handle SELL orders (position reductions) using market_close instead of market_open
-        if not is_buy:  # Target is selling/reducing position
+        # Handle SELL orders
+        # If we already have a position → reduce using market_close
+        # If we have no position → open a new short using market_open (is_buy=False)
+        if not is_buy:  # Target is selling (could be reduction or opening a short)
             my_positions = self.get_my_positions()
             my_position_size = my_positions.get(coin, 0)
-            
-            if abs(my_position_size) < 0.001:  # You don't have this position
-                print(f"\n⏭️  Skipping SELL for {coin}: You don't have a position to sell")
-                logging.info(f"Skipping SELL order for {coin} - no position held")
-                return
             
             # Get current price to check minimum trade value
             current_price = 0
@@ -363,11 +360,99 @@ class CopyTrader:
                 current_price = float(mids.get(coin_data, 0))
             except:
                 pass
-            
+
             # Ensure minimum trade value of $10.50 for sell orders (Hyperliquid minimum notional requirement)
             # Scale up copy_size if trade value is below minimum instead of skipping
             MIN_TRADE_VALUE_TARGET = 10.5
             MIN_TRADE_VALUE_REQUIRED = 10.0
+
+            # If we do NOT have a position, this SELL should open a short
+            if abs(my_position_size) < 0.001:
+                # Scale to meet minimum notional if needed
+                if current_price > 0:
+                    trade_value = copy_size * current_price
+                    if trade_value < MIN_TRADE_VALUE_TARGET:
+                        original_copy_size = copy_size
+                        copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                        print(f"   ⚡ Scaling up short size to meet $10.50 minimum notional:")
+                        print(f"      Original size: {original_copy_size:.6f} (value: ${trade_value:.2f})")
+                        print(f"      Scaled size: {copy_size:.6f} (target value: ${MIN_TRADE_VALUE_TARGET:.2f})")
+
+                # Round size
+                if coin in ["BTC", "ETH"]:
+                    copy_size = round(copy_size, 4)
+                elif coin == "SOL":
+                    copy_size = round(copy_size, 2)
+                else:
+                    copy_size = round(copy_size, 2)
+
+                # Final verification after rounding
+                if current_price > 0:
+                    final_trade_value = copy_size * current_price
+                    if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                        copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                        if coin in ["BTC", "ETH"]:
+                            copy_size = round(copy_size, 4)
+                        elif coin == "SOL":
+                            copy_size = round(copy_size, 2)
+                        else:
+                            copy_size = round(copy_size, 2)
+                        print(f"   ⚠️  Adjusted short size after rounding: {copy_size:.6f}")
+
+                print(f"\n📊 Target opening/increasing short for {coin}:")
+                print(f"   Target change: {size_diff:+.4f}")
+                print(f"   Opening short size: {copy_size:.4f}")
+                if current_price > 0:
+                    print(f"   Trade value: ${(copy_size * current_price):,.2f}")
+
+                try:
+                    # Place aggressive sell (short open)
+                    slippage = 0.05 if copy_size > 1000 else 0.01
+                    result = self.exchange.market_open(
+                        coin,
+                        is_buy=False,
+                        sz=copy_size,
+                        slippage=slippage,
+                    )
+
+                    if result.get("status") == "ok":
+                        filled_size = 0
+                        executed_price = current_price
+                        order_filled = False
+
+                        try:
+                            if "response" in result and "data" in result["response"]:
+                                data = result["response"]["data"]
+                                if "statuses" in data and len(data["statuses"]) > 0:
+                                    status = data["statuses"][0]
+                                    if "filled" in status:
+                                        filled_data = status["filled"]
+                                        filled_size = float(filled_data.get("totalSz", 0))
+                                        executed_price = float(filled_data.get("avgPx", current_price))
+                                        order_filled = filled_size > 0
+                                    elif "error" in status:
+                                        error_msg = status.get("error", "Unknown error")
+                                        print(f"   ⚠️  Short order not filled: {error_msg}")
+                                        logging.warning(f"Short order error for {coin}: {error_msg}")
+                        except Exception as e:
+                            logging.warning(f"Error parsing short order response: {e}")
+
+                        if order_filled:
+                            print(f"   ✅ Short opened successfully!")
+                            print(f"   Filled size: {filled_size:.4f} @ ${executed_price:,.2f}")
+                            self.adjust_copy_percentage()
+                        else:
+                            print(f"   ⚠️  Short order placed but not filled (IOC expired)")
+                    else:
+                        print(f"   ❌ Short open failed: {result.get('response')}")
+                        logging.warning(f"Failed to open short for {coin}: {result}")
+                except Exception as e:
+                    print(f"   ❌ Error opening short: {e}")
+                    logging.error(f"Error opening short for {coin}: {e}")
+
+                return  # Done handling short open
+            
+            # From here on, we have a position → treat as reduction (market_close)
             if current_price > 0:
                 trade_value = copy_size * current_price
                 if trade_value < MIN_TRADE_VALUE_TARGET:
