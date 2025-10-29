@@ -99,8 +99,9 @@ class CopyTrader:
         
         # Track known fills to avoid duplicate execution
         self.known_fills: Set[str] = set()
+        self.processed_fills: Set[str] = set()  # For WebSocket fill tracking
         
-        # Track last seen positions
+        # Track last seen positions (kept for sync/status but not primary detection)
         self.last_positions: Dict[str, Dict] = {}
         
         # Initialize connection
@@ -109,8 +110,9 @@ class CopyTrader:
         print(f"{'='*80}\n")
         print(f"Target wallet:  {target_wallet}")
         
+        # Enable WebSocket for real-time transaction monitoring
         self.address, self.info, self.exchange = example_utils.setup(
-            base_url=constants.MAINNET_API_URL, skip_ws=True
+            base_url=constants.MAINNET_API_URL, skip_ws=False  # Enable WebSocket for instant fill detection
         )
         
         print(f"Your wallet:    {self.address}")
@@ -171,6 +173,8 @@ class CopyTrader:
         print(f"   5. You will be copying both wins AND losses")
         if self.use_isolated_margin:
             print(f"   6. Using isolated margin: each position is isolated and funded separately")
+        print(f"\n📡 Using WebSocket for INSTANT transaction detection")
+        print(f"   Real-time fills - no polling delays!")
         print(f"\n{'='*80}\n")
         
         # Send startup notifications
@@ -844,6 +848,311 @@ class CopyTrader:
         except Exception as e:
             print(f"   ❌ Error placing order: {e}")
     
+    def handle_user_fill(self, fill_data: dict):
+        """
+        Handle a new fill from the target wallet via WebSocket.
+        
+        Args:
+            fill_data: Fill data from WebSocket userFills subscription
+        """
+        try:
+            # Extract fill information
+            coin = fill_data.get("coin")
+            side = fill_data.get("side")  # "A" for buy, "B" for sell
+            size = float(fill_data.get("sz", 0))
+            price = float(fill_data.get("px", 0))
+            fill_hash = fill_data.get("hash", "")
+            fill_time = fill_data.get("time", 0)
+            
+            # Filter: Only process allowed coins
+            if self.allowed_coins is not None and coin not in self.allowed_coins:
+                logging.debug(f"Skipping fill for {coin} (not in allowed coins)")
+                return
+            
+            # Skip if we already processed this fill
+            fill_id = f"{fill_hash}_{fill_time}"
+            if fill_id in self.processed_fills:
+                logging.debug(f"Skipping duplicate fill: {fill_id}")
+                return
+            
+            self.processed_fills.add(fill_id)
+            
+            # Determine if buy or sell
+            is_buy = (side == "A")
+            
+            print(f"\n{'='*80}")
+            print(f"🎯 INSTANT TRANSACTION DETECTED!")
+            print(f"{'='*80}")
+            print(f"   Coin: {coin}")
+            print(f"   Direction: {'BUY' if is_buy else 'SELL'}")
+            print(f"   Size: {size:+.6f}")
+            print(f"   Price: ${price:,.2f}")
+            print(f"   Hash: {fill_hash[:16]}...")
+            print(f"{'='*80}\n")
+            
+            # Send notifications
+            action = "BOUGHT" if is_buy else "SOLD"
+            if self.telegram:
+                self.telegram.notify_target_trade(coin, action, size if is_buy else -size, "BUY" if is_buy else "SELL")
+            
+            if self.enable_notifications:
+                send_notification(
+                    title=f"🎯 Target {action}: {coin}",
+                    message=f"Size: {abs(size):+.4f} @ ${price:,.2f} | Copying...",
+                    sound="Glass"
+                )
+            
+            # Place copy order from fill
+            self.place_copy_order_from_fill(coin, size, is_buy, price)
+            
+        except Exception as e:
+            logging.error(f"Error handling fill: {e}")
+            logging.exception(e)
+    
+    def place_copy_order_from_fill(self, coin: str, fill_size: float, is_buy: bool, fill_price: float):
+        """
+        Place a copy order based on a fill from the target wallet.
+        
+        Args:
+            coin: The coin symbol
+            fill_size: The size of the fill (always positive)
+            is_buy: True if buy, False if sell
+            fill_price: The price of the fill
+        """
+        # Calculate copy size
+        copy_size = abs(fill_size) * self.copy_percentage
+        
+        # Get current price for calculations (use fill price if needed)
+        current_price = fill_price
+        
+        # Get our current position to determine if we're opening or closing
+        my_positions = self.get_my_positions()
+        my_position_size = my_positions.get(coin, 0)
+        
+        # Determine action: opening new position or closing/reducing existing
+        # If we have no position and target sells → open short
+        # If we have no position and target buys → open long
+        # If we have long and target sells → close/reduce long
+        # If we have short and target buys → close/reduce short
+        
+        # For SELL fills
+        if not is_buy:  # Target sold
+            # Check if we should open a short or close/reduce a long
+            if abs(my_position_size) < 0.001:  # No position - open short
+                # Use the short opening logic
+                logging.info(f"Opening new short for {coin} from fill")
+                self._open_position_from_fill(coin, copy_size, is_buy, current_price)
+            elif my_position_size > 0.001:  # We have a long - close/reduce it
+                # Use market_close to reduce position
+                logging.info(f"Closing/reducing long position for {coin} from fill")
+                self._close_position_from_fill(coin, copy_size, my_position_size, current_price)
+            else:  # We have a short - target is increasing short (open more)
+                logging.info(f"Increasing short position for {coin} from fill")
+                self._open_position_from_fill(coin, copy_size, is_buy, current_price)
+        else:  # Target bought - BUY fill
+            # Check if we should open a long or close/reduce a short
+            if abs(my_position_size) < 0.001:  # No position - open long
+                logging.info(f"Opening new long for {coin} from fill")
+                self._open_position_from_fill(coin, copy_size, is_buy, current_price)
+            elif my_position_size < -0.001:  # We have a short - close/reduce it
+                logging.info(f"Closing/reducing short position for {coin} from fill")
+                self._close_position_from_fill(coin, copy_size, abs(my_position_size), current_price)
+            else:  # We have a long - target is increasing long (open more)
+                logging.info(f"Increasing long position for {coin} from fill")
+                self._open_position_from_fill(coin, copy_size, is_buy, current_price)
+    
+    def _open_position_from_fill(self, coin: str, copy_size: float, is_buy: bool, current_price: float):
+        """Helper to open a new position from a fill."""
+        # Ensure minimum trade value of $10.50
+        MIN_TRADE_VALUE_TARGET = 10.5
+        MIN_TRADE_VALUE_REQUIRED = 10.0
+        
+        if current_price > 0:
+            trade_value = copy_size * current_price
+            if trade_value < MIN_TRADE_VALUE_TARGET:
+                original_copy_size = copy_size
+                copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                print(f"   ⚡ Scaling up size to meet $10.50 minimum: {original_copy_size:.6f} -> {copy_size:.6f}")
+        
+        # Round appropriately
+        if coin in ["BTC", "ETH"]:
+            copy_size = round(copy_size, 4)
+        elif coin == "SOL":
+            copy_size = round(copy_size, 2)
+        else:
+            copy_size = round(copy_size, 2)
+        
+        # Final verification
+        if current_price > 0:
+            final_trade_value = copy_size * current_price
+            if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                if coin in ["BTC", "ETH"]:
+                    copy_size = round(copy_size, 4)
+                elif coin == "SOL":
+                    copy_size = round(copy_size, 2)
+                else:
+                    copy_size = round(copy_size, 2)
+        
+        direction = "LONG" if is_buy else "SHORT"
+        print(f"\n📊 Opening {direction} for {coin}:")
+        print(f"   Size: {copy_size:.6f}")
+        if current_price > 0:
+            print(f"   Trade value: ${(copy_size * current_price):,.2f}")
+        
+        # Configure leverage/margin if needed
+        if self.use_isolated_margin and current_price > 0:
+            trade_value = copy_size * current_price
+            print(f"   Setting isolated margin mode for {coin}...")
+            try:
+                leverage_result = self.exchange.update_leverage(self.max_leverage, coin, is_cross=False)
+                if leverage_result.get("status") == "ok":
+                    print(f"   ✅ Leverage set to {self.max_leverage}x (isolated)")
+                else:
+                    logging.warning(f"Could not set leverage for {coin}: {leverage_result}")
+            except Exception as e:
+                logging.warning(f"Error setting leverage for {coin}: {e}")
+            
+            # Add isolated margin
+            required_margin = trade_value / self.max_leverage
+            margin_to_add = required_margin * 1.1
+            margin_to_add = round(margin_to_add, 6)
+            
+            try:
+                margin_result = self.exchange.update_isolated_margin(margin_to_add, coin)
+                if margin_result.get("status") == "ok":
+                    print(f"   ✅ Added ${margin_to_add:,.2f} isolated margin")
+                else:
+                    logging.warning(f"Could not add isolated margin for {coin}: {margin_result}")
+            except Exception as e:
+                logging.warning(f"Error adding isolated margin for {coin}: {e}")
+        
+        # Place market order
+        try:
+            slippage = 0.05 if copy_size > 1000 else 0.01
+            result = self.exchange.market_open(
+                coin,
+                is_buy=is_buy,
+                sz=copy_size,
+                slippage=slippage,
+            )
+            
+            if result.get("status") == "ok":
+                filled_size = 0
+                executed_price = current_price
+                order_filled = False
+                
+                try:
+                    if "response" in result and "data" in result["response"]:
+                        data = result["response"]["data"]
+                        if "statuses" in data and len(data["statuses"]) > 0:
+                            status = data["statuses"][0]
+                            if "filled" in status:
+                                filled_data = status["filled"]
+                                filled_size = float(filled_data.get("totalSz", 0))
+                                executed_price = float(filled_data.get("avgPx", current_price))
+                                order_filled = filled_size > 0
+                            elif "error" in status:
+                                error_msg = status.get("error", "Unknown error")
+                                print(f"   ⚠️  Order not filled: {error_msg}")
+                                logging.warning(f"Order error for {coin}: {error_msg}")
+                except Exception as e:
+                    logging.warning(f"Error parsing order response: {e}")
+                
+                if order_filled:
+                    print(f"   ✅ {direction} opened successfully!")
+                    print(f"   Filled size: {filled_size:.4f} @ ${executed_price:,.2f}")
+                    
+                    # Send Telegram notification
+                    if self.telegram:
+                        trade_value = filled_size * executed_price
+                        self.telegram.notify_trade_executed(coin, "BUY" if is_buy else "SELL", filled_size, trade_value, executed_price)
+                    
+                    self.adjust_copy_percentage()
+                else:
+                    print(f"   ⚠️  Order placed but not filled (IOC expired)")
+                    if self.telegram:
+                        self.telegram.notify_trade_failed(coin, "BUY" if is_buy else "SELL", "IOC order expired - no fill")
+            else:
+                print(f"   ❌ Order failed: {result.get('response')}")
+                if self.telegram:
+                    error_msg = str(result.get('response', 'Unknown error'))
+                    self.telegram.notify_trade_failed(coin, "BUY" if is_buy else "SELL", error_msg)
+        except Exception as e:
+            print(f"   ❌ Error: {e}")
+            logging.error(f"Error opening position for {coin}: {e}")
+            if self.telegram:
+                self.telegram.notify_trade_failed(coin, "BUY" if is_buy else "SELL", str(e))
+    
+    def _close_position_from_fill(self, coin: str, copy_size: float, my_position_size: float, current_price: float):
+        """Helper to close/reduce a position from a fill."""
+        # Ensure we don't try to close more than we have
+        if copy_size > abs(my_position_size):
+            copy_size = abs(my_position_size)
+        
+        # Ensure minimum trade value
+        MIN_TRADE_VALUE_TARGET = 10.5
+        MIN_TRADE_VALUE_REQUIRED = 10.0
+        
+        if current_price > 0:
+            trade_value = copy_size * current_price
+            if trade_value < MIN_TRADE_VALUE_TARGET:
+                copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                if copy_size > abs(my_position_size):
+                    copy_size = abs(my_position_size)
+        
+        # Round appropriately
+        if coin in ["BTC", "ETH"]:
+            copy_size = round(copy_size, 4)
+        elif coin == "SOL":
+            copy_size = round(copy_size, 2)
+        else:
+            copy_size = round(copy_size, 2)
+        
+        print(f"\n📊 Closing position for {coin}:")
+        print(f"   Closing size: {copy_size:.4f}")
+        print(f"   Current position: {my_position_size:+.4f}")
+        if current_price > 0:
+            print(f"   Trade value: ${(copy_size * current_price):,.2f}")
+        
+        try:
+            result = self.exchange.market_close(coin, sz=copy_size)
+            
+            if result.get("status") == "ok":
+                filled_size = 0
+                executed_price = 0
+                order_filled = False
+                
+                try:
+                    if "response" in result and "data" in result["response"]:
+                        data = result["response"]["data"]
+                        if "statuses" in data and len(data["statuses"]) > 0:
+                            status = data["statuses"][0]
+                            if "filled" in status:
+                                filled_data = status["filled"]
+                                filled_size = float(filled_data.get("totalSz", 0))
+                                executed_price = float(filled_data.get("avgPx", 0))
+                                order_filled = filled_size > 0
+                except Exception as e:
+                    logging.warning(f"Error parsing close order response: {e}")
+                
+                if order_filled:
+                    print(f"   ✅ Position closed successfully!")
+                    print(f"   Filled size: {filled_size:.4f} @ ${executed_price:,.2f}")
+                    
+                    if self.telegram:
+                        trade_value = filled_size * executed_price if executed_price > 0 else copy_size * current_price
+                        self.telegram.notify_trade_executed(coin, "SELL", filled_size, trade_value, executed_price)
+                    
+                    self.adjust_copy_percentage()
+                else:
+                    print(f"   ⚠️  Close order placed but may not have filled")
+            else:
+                print(f"   ❌ Failed to close position: {result.get('response')}")
+        except Exception as e:
+            print(f"   ❌ Error closing position: {e}")
+            logging.error(f"Error closing position for {coin}: {e}")
+    
     def monitor_positions(self):
         """Monitor position changes and execute copy trades."""
         print(f"⏰ Last checked: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1005,31 +1314,57 @@ class CopyTrader:
         if sync_on_startup:
             self.sync_positions_on_startup()
         
-        logging.info(f"\n🔄 Starting continuous monitoring...")
-        logging.info(f"   Checking every {interval} seconds")
+        print(f"\n🔌 Connecting to WebSocket for real-time transaction monitoring...")
+        logging.info(f"\n🔄 Starting WebSocket monitoring...")
+        logging.info(f"   Real-time fill detection enabled")
         logging.info("   Press Ctrl+C to stop\n")
         
-        consecutive_errors = 0
-        max_consecutive_errors = 5
+        def on_fill(msg):
+            """Callback when we receive user fill data."""
+            try:
+                data = msg.get("data", {})
+                
+                # Check if this is for our target wallet
+                if data.get("user", "").lower() != self.target_wallet:
+                    return
+                
+                fills = data.get("fills", [])
+                
+                # Process each fill
+                for fill in fills:
+                    self.handle_user_fill(fill)
+            except Exception as e:
+                logging.error(f"Error in on_fill callback: {e}")
+                logging.exception(e)
+        
+        # Subscribe to userFills for the target wallet
+        subscription = {"type": "userFills", "user": self.target_wallet}
+        
+        logging.info(f"Subscribing to fills for {self.target_wallet}")
+        self.info.subscribe(subscription, on_fill)
+        
+        print(f"✅ WebSocket connected and subscribed!")
+        print(f"⏳ Waiting for transactions... (Press Ctrl+C to stop)")
+        print(f"\n📊 The bot will now copy each transaction as it happens in real-time\n")
         
         try:
+            # Keep the WebSocket connection alive
+            # Still do periodic position monitoring for status updates
+            status_update_interval = 60  # Update status every 60 seconds
+            last_status_update = time.time()
+            
             while True:
-                try:
-                    self.monitor_positions()
-                    consecutive_errors = 0  # Reset on successful check
-                except Exception as e:
-                    consecutive_errors += 1
-                    logging.error(f"Error during monitoring (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
-                    
-                    if consecutive_errors >= max_consecutive_errors:
-                        logging.critical(f"Too many consecutive errors. Exiting to prevent issues.")
-                        raise
-                    
-                    # Wait before retry
-                    time.sleep(10)
+                time.sleep(1)
                 
-                time.sleep(interval)
-                
+                # Periodic status updates (optional - just for display)
+                current_time = time.time()
+                if current_time - last_status_update >= status_update_interval:
+                    try:
+                        self.monitor_positions()  # This just updates display, doesn't trigger trades
+                        last_status_update = current_time
+                    except Exception as e:
+                        logging.warning(f"Error in periodic status update: {e}")
+                        
         except KeyboardInterrupt:
             logging.info("\n\n🛑 Monitoring stopped by user")
             self._notify_shutdown("User stopped")
@@ -1037,6 +1372,13 @@ class CopyTrader:
             logging.critical(f"Fatal error: {e}")
             self._notify_shutdown(f"Error: {e}")
             raise
+        finally:
+            # Cleanup WebSocket connection
+            if hasattr(self.info, 'ws_manager') and self.info.ws_manager:
+                try:
+                    self.info.disconnect_websocket()
+                except:
+                    pass
     
     def _notify_shutdown(self, reason: str):
         """Notify when bot stops."""
