@@ -62,7 +62,7 @@ def send_notification(title: str, message: str, sound: str = "default"):
 
 
 class CopyTrader:
-    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True, telegram_config: dict = None, use_isolated_margin: bool = True):
+    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True, telegram_config: dict = None, use_isolated_margin: bool = True, position_size_multiplier: float = 1.0, allowed_coins: list = None):
         """
         Initialize the copy trader.
         
@@ -74,11 +74,16 @@ class CopyTrader:
             enable_notifications: Send macOS notifications on trades (default: True)
             telegram_config: Dict with 'bot_token' and 'chat_id' for Telegram notifications
             use_isolated_margin: Use isolated margin instead of cross margin (default: True)
+            position_size_multiplier: Multiply the calculated copy percentage by this amount (default: 1.0)
+                                     e.g., 1.5 = 50% larger positions, 2.0 = double position size
+            allowed_coins: List of coin symbols to trade (e.g., ["BTC", "ETH"]). If None, trades all coins.
         """
         self.target_wallet = target_wallet.lower()
         self.max_leverage = max_leverage
         self.enable_notifications = enable_notifications
         self.use_isolated_margin = use_isolated_margin
+        self.position_size_multiplier = position_size_multiplier
+        self.allowed_coins = allowed_coins  # If None, allows all coins
         
         # Setup Telegram notifier if configured
         self.telegram = None
@@ -134,19 +139,27 @@ class CopyTrader:
         # Calculate copy percentage
         if auto_calculate and copy_percentage is None:
             if my_value > 0 and target_value > 0:
-                self.copy_percentage = min(my_value / target_value, 1.0)  # Don't go over 100%
-                print(f"\n📊 Automatically calculated copy percentage: {self.copy_percentage * 100:.2f}%")
-                print(f"   This means you'll trade ~{self.copy_percentage * target_value:,.2f} worth of positions")
+                base_percentage = my_value / target_value
+                # Apply position size multiplier (allows going over 100% if desired)
+                self.copy_percentage = base_percentage * self.position_size_multiplier
+                print(f"\n📊 Automatically calculated copy percentage: {base_percentage * 100:.2f}%")
+                if self.position_size_multiplier != 1.0:
+                    print(f"   Applied position size multiplier: {self.position_size_multiplier}x")
+                print(f"   Final copy percentage: {self.copy_percentage * 100:.2f}%")
+                print(f"   This means you'll trade ~${self.copy_percentage * target_value:,.2f} worth of positions")
             else:
                 print("\n⚠️  Warning: Cannot auto-calculate, using manual percentage")
-                self.copy_percentage = 0.01  # Default to 1% for safety
+                self.copy_percentage = 0.01 * self.position_size_multiplier  # Default to 1% for safety, then apply multiplier
         elif copy_percentage is not None:
-            self.copy_percentage = copy_percentage
+            self.copy_percentage = copy_percentage * self.position_size_multiplier
             print(f"\n📊 Using manual copy percentage: {copy_percentage * 100}%")
-            estimated_trade_value = copy_percentage * target_value
+            if self.position_size_multiplier != 1.0:
+                print(f"   Applied position size multiplier: {self.position_size_multiplier}x")
+            print(f"   Final copy percentage: {self.copy_percentage * 100:.2f}%")
+            estimated_trade_value = self.copy_percentage * target_value
             print(f"   This means you'll trade ~${estimated_trade_value:,.2f} worth of positions")
         else:
-            self.copy_percentage = 0.01  # Safe default
+            self.copy_percentage = 0.01 * self.position_size_multiplier  # Safe default, then apply multiplier
             print(f"\n⚠️  Using safe default copy percentage: {self.copy_percentage * 100}%")
         
         # Safety warning
@@ -332,8 +345,8 @@ class CopyTrader:
         copy_size = abs(size_diff) * self.copy_percentage
         is_buy = size_diff > 0
         
-        # If this is a SELL and you don't have a position, skip it
-        if not is_buy:  # Selling
+        # Handle SELL orders (position reductions) using market_close instead of market_open
+        if not is_buy:  # Target is selling/reducing position
             my_positions = self.get_my_positions()
             my_position_size = my_positions.get(coin, 0)
             
@@ -341,6 +354,135 @@ class CopyTrader:
                 print(f"\n⏭️  Skipping SELL for {coin}: You don't have a position to sell")
                 logging.info(f"Skipping SELL order for {coin} - no position held")
                 return
+            
+            # Get current price to check minimum trade value
+            current_price = 0
+            try:
+                coin_data = self.info.name_to_coin[coin]
+                mids = self.info.all_mids()
+                current_price = float(mids.get(coin_data, 0))
+            except:
+                pass
+            
+            # Ensure minimum trade value of $10 for sell orders (Hyperliquid minimum notional requirement)
+            # Use $12 as target to account for rounding, price fluctuations, and slippage
+            MIN_TRADE_VALUE_TARGET = 12.0
+            MIN_TRADE_VALUE_REQUIRED = 10.0
+            if current_price > 0:
+                trade_value = copy_size * current_price
+                if trade_value < MIN_TRADE_VALUE_TARGET:
+                    # Scale up copy_size to meet minimum trade value
+                    original_copy_size = copy_size
+                    copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                    print(f"   ⚡ Scaling up close size to meet $10 minimum notional:")
+                    print(f"      Original size: {original_copy_size:.6f} (value: ${trade_value:.2f})")
+                    print(f"      Scaled size: {copy_size:.6f} (target value: ${MIN_TRADE_VALUE_TARGET:.2f})")
+            
+            # Round close amount appropriately
+            if coin in ["BTC", "ETH"]:
+                copy_size = round(copy_size, 4)
+            elif coin == "SOL":
+                copy_size = round(copy_size, 2)
+            else:
+                copy_size = round(copy_size, 2)
+            
+            # Verify final trade value is still above minimum after rounding
+            if current_price > 0:
+                final_trade_value = copy_size * current_price
+                if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                    # Rounding brought us below minimum, scale up again with larger buffer
+                    copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                    if coin in ["BTC", "ETH"]:
+                        copy_size = round(copy_size, 4)
+                    elif coin == "SOL":
+                        copy_size = round(copy_size, 2)
+                    else:
+                        copy_size = round(copy_size, 2)
+                    final_trade_value = copy_size * current_price
+                    print(f"   ⚠️  Adjusted close size after rounding: {copy_size:.6f} (value: ${final_trade_value:.2f})")
+                    
+                    # One more check - if still below, add a small buffer
+                    if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                        copy_size = (MIN_TRADE_VALUE_REQUIRED + 0.5) / current_price
+                        if coin in ["BTC", "ETH"]:
+                            copy_size = round(copy_size, 4)
+                        elif coin == "SOL":
+                            copy_size = round(copy_size, 2)
+                        else:
+                            copy_size = round(copy_size, 2)
+                        print(f"   ⚠️  Final adjustment to ensure above minimum: {copy_size:.6f}")
+            
+            # Make sure we don't try to close more than we have
+            if copy_size > abs(my_position_size):
+                copy_size = abs(my_position_size)
+            
+            if copy_size < 0.001:
+                print(f"\n⏭️  Skipping {coin}: Close size {copy_size:.6f} is below minimum")
+                return
+            
+            # Final check before placing order: verify trade value is above minimum
+            if current_price > 0:
+                final_check_value = copy_size * current_price
+                if final_check_value < 10.0:
+                    # One last adjustment to ensure we're above minimum
+                    copy_size = 10.5 / current_price
+                    if coin in ["BTC", "ETH"]:
+                        copy_size = round(copy_size, 4)
+                    elif coin == "SOL":
+                        copy_size = round(copy_size, 2)
+                    else:
+                        copy_size = round(copy_size, 2)
+                    print(f"   ⚠️  Final pre-order check: adjusted to {copy_size:.6f} (value: ${copy_size * current_price:.2f})")
+            
+            print(f"\n📊 Target selling/reducing position for {coin}:")
+            print(f"   Target reduced by: {abs(size_diff):+.4f}")
+            print(f"   Closing your position by: {copy_size:.4f}")
+            print(f"   Your current position: {my_position_size:+.4f}")
+            if current_price > 0:
+                trade_value = copy_size * current_price
+                print(f"   Trade value: ${trade_value:,.2f}")
+            
+            try:
+                # Use market_close to properly reduce the position
+                result = self.exchange.market_close(coin, sz=copy_size)
+                
+                if result.get("status") == "ok":
+                    # Check if order actually filled
+                    filled_size = 0
+                    executed_price = 0
+                    order_filled = False
+                    
+                    try:
+                        if "response" in result and "data" in result["response"]:
+                            data = result["response"]["data"]
+                            if "statuses" in data and len(data["statuses"]) > 0:
+                                status = data["statuses"][0]
+                                if "filled" in status:
+                                    filled_data = status["filled"]
+                                    filled_size = float(filled_data.get("totalSz", 0))
+                                    executed_price = float(filled_data.get("avgPx", 0))
+                                    order_filled = filled_size > 0
+                                elif "error" in status:
+                                    error_msg = status.get("error", "Unknown error")
+                                    print(f"   ⚠️  Order not filled: {error_msg}")
+                                    logging.warning(f"Order error for {coin}: {error_msg}")
+                    except Exception as e:
+                        logging.warning(f"Error parsing order response: {e}")
+                    
+                    if order_filled:
+                        print(f"   ✅ Position reduced successfully!")
+                        print(f"   Filled size: {filled_size:.4f} @ ${executed_price:,.2f}")
+                        self.adjust_copy_percentage()
+                    else:
+                        print(f"   ⚠️  Order placed but not filled (IOC order expired)")
+                else:
+                    print(f"   ❌ Failed to close position: {result.get('response')}")
+                    logging.warning(f"Failed to close {coin} position: {result}")
+            except Exception as e:
+                print(f"   ❌ Error closing position: {e}")
+                logging.error(f"Error closing {coin} position: {e}")
+            
+            return  # Exit early after handling sell order
         
         # Round to reasonable precision to avoid issues with tiny positions
         # For BTC/ETH we need at least 0.001
@@ -350,6 +492,30 @@ class CopyTrader:
             print(f"\n⏭️  Skipping {coin}: Copy size {copy_size:.6f} is below minimum {min_size}")
             return
         
+        # Get current price early to check minimum trade value
+        current_price = 0
+        try:
+            coin_data = self.info.name_to_coin[coin]
+            mids = self.info.all_mids()
+            current_price = float(mids.get(coin_data, 0))
+        except:
+            pass
+        
+        # Ensure minimum trade value of $10 for buy orders (Hyperliquid minimum notional requirement)
+        # Use $12 as target to account for rounding, price fluctuations, and slippage
+        MIN_TRADE_VALUE_TARGET = 12.0
+        MIN_TRADE_VALUE_REQUIRED = 10.0
+        
+        if current_price > 0:
+            trade_value = copy_size * current_price
+            if trade_value < MIN_TRADE_VALUE_TARGET:
+                # Scale up copy_size to meet minimum trade value
+                original_copy_size = copy_size
+                copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                print(f"   ⚡ Scaling up trade size to meet $10 minimum notional:")
+                print(f"      Original size: {original_copy_size:.6f} (value: ${trade_value:.2f})")
+                print(f"      Scaled size: {copy_size:.6f} (target value: ${MIN_TRADE_VALUE_TARGET:.2f})")
+        
         # Round to appropriate decimals
         if coin in ["BTC", "ETH"]:
             copy_size = round(copy_size, 4)
@@ -357,6 +523,32 @@ class CopyTrader:
             copy_size = round(copy_size, 2)
         else:
             copy_size = round(copy_size, 2)
+        
+        # Final verification: ensure we're still above $10 after rounding
+        if current_price > 0:
+            final_trade_value = copy_size * current_price
+            if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                # Rounding or price change brought us below minimum, scale up again with larger buffer
+                copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                if coin in ["BTC", "ETH"]:
+                    copy_size = round(copy_size, 4)
+                elif coin == "SOL":
+                    copy_size = round(copy_size, 2)
+                else:
+                    copy_size = round(copy_size, 2)
+                final_trade_value = copy_size * current_price
+                print(f"   ⚠️  Adjusted size after rounding to ensure $10 minimum: {copy_size:.6f} (value: ${final_trade_value:.2f})")
+                
+                # One more check - if still below, add a small buffer
+                if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                    copy_size = (MIN_TRADE_VALUE_REQUIRED + 0.5) / current_price
+                    if coin in ["BTC", "ETH"]:
+                        copy_size = round(copy_size, 4)
+                    elif coin == "SOL":
+                        copy_size = round(copy_size, 2)
+                    else:
+                        copy_size = round(copy_size, 2)
+                    print(f"   ⚠️  Final adjustment to ensure above minimum: {copy_size:.6f}")
         
         try:
             # Send notification when target makes a move
@@ -372,15 +564,6 @@ class CopyTrader:
                     message=f"Size: {size_text} | Copying {'BUY' if is_buy else 'SELL'} order...",
                     sound="Glass"
                 )
-            
-            # Get current price
-            current_price = 0
-            try:
-                coin_data = self.info.name_to_coin[coin]
-                mids = self.info.all_mids()
-                current_price = float(mids.get(coin_data, 0))
-            except:
-                pass
             
             print(f"\n📊 Position change detected for {coin}:")
             print(f"   Previous size: {prev_size}")
@@ -415,6 +598,9 @@ class CopyTrader:
                     required_margin = trade_value / self.max_leverage
                     # Add a 10% buffer for safety
                     margin_to_add = required_margin * 1.1
+                    # Round to 6 decimal places (USD precision) to avoid rounding errors
+                    # The API requires exact 6-decimal precision for USD amounts
+                    margin_to_add = round(margin_to_add, 6)
                     
                     try:
                         margin_result = self.exchange.update_isolated_margin(margin_to_add, coin)
@@ -425,33 +611,67 @@ class CopyTrader:
                     except Exception as e:
                         logging.warning(f"Error adding isolated margin for {coin}: {e}")
             
+            # Final check before placing order: verify trade value is above minimum
+            # Get fresh price to account for any movement
+            if current_price > 0:
+                final_check_value = copy_size * current_price
+                if final_check_value < 10.0:
+                    # One last adjustment to ensure we're above minimum
+                    copy_size = 10.5 / current_price
+                    if coin in ["BTC", "ETH"]:
+                        copy_size = round(copy_size, 4)
+                    elif coin == "SOL":
+                        copy_size = round(copy_size, 2)
+                    else:
+                        copy_size = round(copy_size, 2)
+                    print(f"   ⚠️  Final pre-order check: adjusted to {copy_size:.6f} (value: ${copy_size * current_price:.2f})")
+            
             # Place market order (automatic - no confirmation needed)
+            # Increase slippage for very large orders to improve fill probability
+            slippage = 0.05 if copy_size > 1000 else 0.01  # 5% slippage for large orders, 1% for normal
             result = self.exchange.market_open(
                 coin, 
                 is_buy=is_buy, 
                 sz=copy_size,
-                slippage=0.01  # 1% slippage
+                slippage=slippage
             )
             
             if result.get("status") == "ok":
-                # Get executed price from result
+                # Check if order actually filled
+                filled_size = 0
                 executed_price = current_price
+                order_filled = False
+                
                 try:
                     if "response" in result and "data" in result["response"]:
-                        # Try to get executed price from response
                         data = result["response"]["data"]
                         if "statuses" in data and len(data["statuses"]) > 0:
-                            if "filled" in data["statuses"][0]:
-                                filled_data = data["statuses"][0]["filled"]
-                                if "totalSz" in filled_data and "avgPx" in filled_data:
-                                    executed_price = float(filled_data["avgPx"])
-                except:
-                    pass
+                            status = data["statuses"][0]
+                            if "filled" in status:
+                                filled_data = status["filled"]
+                                filled_size = float(filled_data.get("totalSz", 0))
+                                executed_price = float(filled_data.get("avgPx", current_price))
+                                order_filled = filled_size > 0
+                            elif "error" in status:
+                                error_msg = status.get("error", "Unknown error")
+                                print(f"   ⚠️  Order not filled: {error_msg}")
+                                logging.warning(f"Order error for {coin}: {error_msg}")
+                except Exception as e:
+                    logging.warning(f"Error parsing order response: {e}")
                 
-                print(f"   ✅ Order placed successfully!")
-                print(f"   Price @ execution: ${executed_price:,.2f}")
-                
-                trade_value = copy_size * executed_price
+                if order_filled:
+                    print(f"   ✅ Order filled successfully!")
+                    print(f"   Filled size: {filled_size:.4f} (requested: {copy_size:.4f})")
+                    print(f"   Price @ execution: ${executed_price:,.2f}")
+                    
+                    trade_value = filled_size * executed_price
+                else:
+                    print(f"   ⚠️  Order placed but not filled (IOC order expired)")
+                    print(f"   Requested size: {copy_size:.4f}")
+                    print(f"   This may be due to insufficient liquidity or price moving too fast")
+                    logging.warning(f"IOC order for {coin} did not fill - size: {copy_size}, direction: {'BUY' if is_buy else 'SELL'}")
+                    # Don't send success notification if order didn't fill
+                    return
                 
                 # Send success notifications
                 if self.telegram:
@@ -502,6 +722,10 @@ class CopyTrader:
         
         # Compare with previous positions
         for coin, position in current_positions.items():
+            # Filter: Only process allowed coins (SOL, BTC, ETH, BNB, MON, HYPE)
+            if self.allowed_coins is not None and coin not in self.allowed_coins:
+                continue
+            
             current_size = float(position.get("szi", 0))
             prev_size = float(self.last_positions.get(coin, {}).get("szi", 0))
             
@@ -519,6 +743,10 @@ class CopyTrader:
         
         # Handle positions that were closed or reduced
         for coin in self.last_positions:
+            # Filter: Only process allowed coins (SOL, BTC, ETH, BNB, MON, HYPE)
+            if self.allowed_coins is not None and coin not in self.allowed_coins:
+                continue
+            
             prev_size = float(self.last_positions[coin].get("szi", 0))
             
             if coin not in current_positions:
@@ -681,7 +909,7 @@ class CopyTrader:
 def main():
     # ===== CONFIGURATION =====
     # Target wallet to copy from
-    TARGET_WALLET = "0xc20ac4dc4188660cbf555448af52694ca62b0734"
+    TARGET_WALLET = "0x023a3d058020fb76cca98f01b3c48c8938a22355"
     
     # AUTO-CALCULATE: Automatically calculate copy percentage based on account values
     # If True: Uses (your account value / target account value) as the copy percentage
@@ -692,13 +920,18 @@ def main():
     # 1.0 = 100%, 0.5 = 50%, 0.1 = 10%, etc.
     COPY_PERCENTAGE = None  # Set to a value like 0.01 for 1% if you want manual control
     
+    # POSITION SIZE MULTIPLIER: Multiply the calculated copy percentage by this amount
+    # 1.0 = no change, 1.5 = 50% larger positions, 2.0 = double position size, 0.5 = half position size
+    # This allows you to scale positions up/down from the auto-calculated amount
+    POSITION_SIZE_MULTIPLIER = 100000.0  # Double the position size
+    
     # Check interval in seconds
     # Lower values = faster response time but more API requests
     # Rate limit: 1,200 requests/minute per IP (about 20 requests/second)
     # Recommended: 5 seconds = ~12 requests/minute per target wallet
     # Minimum safe: 3 seconds = ~20 requests/minute per target wallet
     # You can run multiple targets if staying under rate limits
-    CHECK_INTERVAL = 3  # Check every 5 seconds (safe for quick response)
+    CHECK_INTERVAL = 3  # Check every 3 seconds (safe for quick response)
     
     # ==========================
     
@@ -726,12 +959,15 @@ def main():
     # Sync positions on startup - ensures bot aligns with target after restart
     # True  = Check if positions are aligned and report
     # False = Don't check positions on startup
-    SYNC_ON_STARTUP = True
+    SYNC_ON_STARTUP = False
     
     # Use isolated margin instead of cross margin
     # True  = Use isolated margin (each position has dedicated margin)
     # False = Use cross margin (all positions share margin pool)
-    USE_ISOLATED_MARGIN = True
+    USE_ISOLATED_MARGIN = False
+    
+    # Only trade specific coins (SOL, BTC, ETH, BNB, MON, HYPE)
+    ALLOWED_COINS = ["SOL", "BTC", "ETH", "BNB", "MON", "HYPE"]
     
     # ==========================
     
@@ -751,7 +987,9 @@ def main():
         max_leverage=10,
         enable_notifications=ENABLE_NOTIFICATIONS,
         telegram_config=telegram_config,
-        use_isolated_margin=USE_ISOLATED_MARGIN
+        use_isolated_margin=USE_ISOLATED_MARGIN,
+        position_size_multiplier=POSITION_SIZE_MULTIPLIER,
+        allowed_coins=ALLOWED_COINS
     )
     
     # Set whether to copy existing positions
