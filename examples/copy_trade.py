@@ -922,8 +922,27 @@ class CopyTrader:
         # Calculate copy size
         copy_size = abs(fill_size) * self.copy_percentage
         
-        # Get current price for calculations (use fill price if needed)
+        # Get current price for calculations
+        # Try to get fresh price, fallback to fill price
         current_price = fill_price
+        try:
+            coin_data = self.info.name_to_coin[coin]
+            mids = self.info.all_mids()
+            fresh_price = float(mids.get(coin_data, fill_price))
+            if fresh_price > 0:
+                current_price = fresh_price
+        except Exception as e:
+            logging.debug(f"Could not get fresh price for {coin}, using fill price: {e}")
+        
+        # Early check: if the calculated trade value is below minimum, scale up immediately
+        MIN_TRADE_VALUE_TARGET = 10.5
+        if current_price > 0 and copy_size > 0:
+            initial_trade_value = copy_size * current_price
+            if initial_trade_value < MIN_TRADE_VALUE_TARGET:
+                # Scale up before any position checks
+                original_copy_size = copy_size
+                copy_size = MIN_TRADE_VALUE_TARGET / current_price
+                logging.info(f"Early scaling for {coin}: {original_copy_size:.6f} -> {copy_size:.6f} to meet $10.50 minimum")
         
         # Get our current position to determine if we're opening or closing
         my_positions = self.get_my_positions()
@@ -982,10 +1001,16 @@ class CopyTrader:
         else:
             copy_size = round(copy_size, 2)
         
-        # Final verification
+        # Final verification after rounding - may need multiple iterations
         if current_price > 0:
-            final_trade_value = copy_size * current_price
-            if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+            max_iterations = 3
+            iteration = 0
+            while iteration < max_iterations:
+                final_trade_value = copy_size * current_price
+                if final_trade_value >= MIN_TRADE_VALUE_REQUIRED:
+                    break  # We're good
+                
+                # Scale up to meet minimum
                 copy_size = MIN_TRADE_VALUE_TARGET / current_price
                 if coin in ["BTC", "ETH"]:
                     copy_size = round(copy_size, 4)
@@ -993,12 +1018,52 @@ class CopyTrader:
                     copy_size = round(copy_size, 2)
                 else:
                     copy_size = round(copy_size, 2)
+                iteration += 1
+            
+            # One final check - if still below, use a larger buffer
+            final_trade_value = copy_size * current_price
+            if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                # Use $11 as final buffer to ensure we're above $10 after all rounding
+                copy_size = 11.0 / current_price
+                if coin in ["BTC", "ETH"]:
+                    copy_size = round(copy_size, 4)
+                elif coin == "SOL":
+                    copy_size = round(copy_size, 2)
+                else:
+                    copy_size = round(copy_size, 2)
+                print(f"   ⚠️  Final buffer adjustment to $11.00 to ensure minimum: {copy_size:.6f}")
+        
+        # Get fresh price right before order to account for any movement
+        try:
+            coin_data = self.info.name_to_coin[coin]
+            mids = self.info.all_mids()
+            fresh_price = float(mids.get(coin_data, current_price))
+            if fresh_price > 0:
+                current_price = fresh_price
+        except:
+            pass
+        
+        # One more final check with fresh price
+        if current_price > 0:
+            final_check_value = copy_size * current_price
+            if final_check_value < MIN_TRADE_VALUE_REQUIRED:
+                copy_size = 11.0 / current_price
+                if coin in ["BTC", "ETH"]:
+                    copy_size = round(copy_size, 4)
+                elif coin == "SOL":
+                    copy_size = round(copy_size, 2)
+                else:
+                    copy_size = round(copy_size, 2)
+                print(f"   ⚠️  Pre-order adjustment with fresh price: {copy_size:.6f} (value: ${copy_size * current_price:.2f})")
         
         direction = "LONG" if is_buy else "SHORT"
         print(f"\n📊 Opening {direction} for {coin}:")
         print(f"   Size: {copy_size:.6f}")
         if current_price > 0:
-            print(f"   Trade value: ${(copy_size * current_price):,.2f}")
+            final_trade_value_check = copy_size * current_price
+            print(f"   Trade value: ${final_trade_value_check:,.2f}")
+            if final_trade_value_check < 10.0:
+                print(f"   ⚠️  WARNING: Trade value ${final_trade_value_check:.2f} is below $10 minimum!")
         
         # Configure leverage/margin if needed
         if self.use_isolated_margin and current_price > 0:
@@ -1086,20 +1151,20 @@ class CopyTrader:
     
     def _close_position_from_fill(self, coin: str, copy_size: float, my_position_size: float, current_price: float):
         """Helper to close/reduce a position from a fill."""
-        # Ensure we don't try to close more than we have
-        if copy_size > abs(my_position_size):
-            copy_size = abs(my_position_size)
-        
         # Ensure minimum trade value
         MIN_TRADE_VALUE_TARGET = 10.5
         MIN_TRADE_VALUE_REQUIRED = 10.0
         
+        # Ensure we don't try to close more than we have
         if current_price > 0:
             trade_value = copy_size * current_price
             if trade_value < MIN_TRADE_VALUE_TARGET:
-                copy_size = MIN_TRADE_VALUE_TARGET / current_price
-                if copy_size > abs(my_position_size):
-                    copy_size = abs(my_position_size)
+                # Scale up to meet minimum, but cap at position size
+                scaled_size = MIN_TRADE_VALUE_TARGET / current_price
+                copy_size = min(scaled_size, abs(my_position_size))
+                if copy_size < abs(my_position_size) and copy_size * current_price < MIN_TRADE_VALUE_REQUIRED:
+                    # If scaled size still below minimum and we have enough position, use larger buffer
+                    copy_size = min(11.0 / current_price, abs(my_position_size))
         
         # Round appropriately
         if coin in ["BTC", "ETH"]:
@@ -1109,11 +1174,62 @@ class CopyTrader:
         else:
             copy_size = round(copy_size, 2)
         
+        # Final verification after rounding
+        if current_price > 0:
+            final_trade_value = copy_size * current_price
+            if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                # Rounding brought us below - scale up again, but respect position limit
+                scaled_size = MIN_TRADE_VALUE_TARGET / current_price
+                copy_size = min(scaled_size, abs(my_position_size))
+                if coin in ["BTC", "ETH"]:
+                    copy_size = round(copy_size, 4)
+                elif coin == "SOL":
+                    copy_size = round(copy_size, 2)
+                else:
+                    copy_size = round(copy_size, 2)
+                
+                # If still below after rounding, use larger buffer if position allows
+                final_trade_value = copy_size * current_price
+                if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
+                    copy_size = min(11.0 / current_price, abs(my_position_size))
+                    if coin in ["BTC", "ETH"]:
+                        copy_size = round(copy_size, 4)
+                    elif coin == "SOL":
+                        copy_size = round(copy_size, 2)
+                    else:
+                        copy_size = round(copy_size, 2)
+        
+        # Get fresh price right before order
+        try:
+            coin_data = self.info.name_to_coin[coin]
+            mids = self.info.all_mids()
+            fresh_price = float(mids.get(coin_data, current_price))
+            if fresh_price > 0:
+                current_price = fresh_price
+        except:
+            pass
+        
+        # Final pre-order check
+        if current_price > 0:
+            final_check_value = copy_size * current_price
+            if final_check_value < MIN_TRADE_VALUE_REQUIRED:
+                copy_size = min(11.0 / current_price, abs(my_position_size))
+                if coin in ["BTC", "ETH"]:
+                    copy_size = round(copy_size, 4)
+                elif coin == "SOL":
+                    copy_size = round(copy_size, 2)
+                else:
+                    copy_size = round(copy_size, 2)
+                print(f"   ⚠️  Pre-order adjustment: {copy_size:.6f} (value: ${copy_size * current_price:.2f})")
+        
         print(f"\n📊 Closing position for {coin}:")
         print(f"   Closing size: {copy_size:.4f}")
         print(f"   Current position: {my_position_size:+.4f}")
         if current_price > 0:
-            print(f"   Trade value: ${(copy_size * current_price):,.2f}")
+            final_value = copy_size * current_price
+            print(f"   Trade value: ${final_value:,.2f}")
+            if final_value < 10.0:
+                print(f"   ⚠️  WARNING: Trade value ${final_value:.2f} is below $10 minimum!")
         
         try:
             result = self.exchange.market_close(coin, sz=copy_size)
