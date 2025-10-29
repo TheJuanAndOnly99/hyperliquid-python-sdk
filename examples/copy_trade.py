@@ -364,17 +364,17 @@ class CopyTrader:
             except:
                 pass
             
-            # Ensure minimum trade value of $10 for sell orders (Hyperliquid minimum notional requirement)
-            # Use $12 as target to account for rounding, price fluctuations, and slippage
-            MIN_TRADE_VALUE_TARGET = 12.0
+            # Ensure minimum trade value of $10.50 for sell orders (Hyperliquid minimum notional requirement)
+            # Scale up copy_size if trade value is below minimum instead of skipping
+            MIN_TRADE_VALUE_TARGET = 10.5
             MIN_TRADE_VALUE_REQUIRED = 10.0
             if current_price > 0:
                 trade_value = copy_size * current_price
                 if trade_value < MIN_TRADE_VALUE_TARGET:
-                    # Scale up copy_size to meet minimum trade value
+                    # Scale up copy_size to meet minimum trade value instead of skipping
                     original_copy_size = copy_size
                     copy_size = MIN_TRADE_VALUE_TARGET / current_price
-                    print(f"   ⚡ Scaling up close size to meet $10 minimum notional:")
+                    print(f"   ⚡ Scaling up close size to meet $10.50 minimum notional:")
                     print(f"      Original size: {original_copy_size:.6f} (value: ${trade_value:.2f})")
                     print(f"      Scaled size: {copy_size:.6f} (target value: ${MIN_TRADE_VALUE_TARGET:.2f})")
             
@@ -401,9 +401,9 @@ class CopyTrader:
                     final_trade_value = copy_size * current_price
                     print(f"   ⚠️  Adjusted close size after rounding: {copy_size:.6f} (value: ${final_trade_value:.2f})")
                     
-                    # One more check - if still below, add a small buffer
+                    # One more check - if still below after rounding, scale up again
                     if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
-                        copy_size = (MIN_TRADE_VALUE_REQUIRED + 0.5) / current_price
+                        copy_size = MIN_TRADE_VALUE_TARGET / current_price
                         if coin in ["BTC", "ETH"]:
                             copy_size = round(copy_size, 4)
                         elif coin == "SOL":
@@ -416,16 +416,13 @@ class CopyTrader:
             if copy_size > abs(my_position_size):
                 copy_size = abs(my_position_size)
             
-            if copy_size < 0.001:
-                print(f"\n⏭️  Skipping {coin}: Close size {copy_size:.6f} is below minimum")
-                return
-            
             # Final check before placing order: verify trade value is above minimum
+            # Scale up if needed instead of skipping
             if current_price > 0:
                 final_check_value = copy_size * current_price
-                if final_check_value < 10.0:
+                if final_check_value < MIN_TRADE_VALUE_REQUIRED:
                     # One last adjustment to ensure we're above minimum
-                    copy_size = 10.5 / current_price
+                    copy_size = MIN_TRADE_VALUE_TARGET / current_price
                     if coin in ["BTC", "ETH"]:
                         copy_size = round(copy_size, 4)
                     elif coin == "SOL":
@@ -484,14 +481,6 @@ class CopyTrader:
             
             return  # Exit early after handling sell order
         
-        # Round to reasonable precision to avoid issues with tiny positions
-        # For BTC/ETH we need at least 0.001
-        min_size = 0.001 if coin in ["BTC", "ETH", "BNB", "SOL"] else 0.01
-        
-        if copy_size < min_size:
-            print(f"\n⏭️  Skipping {coin}: Copy size {copy_size:.6f} is below minimum {min_size}")
-            return
-        
         # Get current price early to check minimum trade value
         current_price = 0
         try:
@@ -501,18 +490,18 @@ class CopyTrader:
         except:
             pass
         
-        # Ensure minimum trade value of $10 for buy orders (Hyperliquid minimum notional requirement)
-        # Use $12 as target to account for rounding, price fluctuations, and slippage
-        MIN_TRADE_VALUE_TARGET = 12.0
+        # Ensure minimum trade value of $10.50 for buy orders (Hyperliquid minimum notional requirement)
+        # Scale up copy_size if trade value is below minimum instead of skipping
+        MIN_TRADE_VALUE_TARGET = 10.5
         MIN_TRADE_VALUE_REQUIRED = 10.0
         
         if current_price > 0:
             trade_value = copy_size * current_price
             if trade_value < MIN_TRADE_VALUE_TARGET:
-                # Scale up copy_size to meet minimum trade value
+                # Scale up copy_size to meet minimum trade value instead of skipping
                 original_copy_size = copy_size
                 copy_size = MIN_TRADE_VALUE_TARGET / current_price
-                print(f"   ⚡ Scaling up trade size to meet $10 minimum notional:")
+                print(f"   ⚡ Scaling up trade size to meet $10.50 minimum notional:")
                 print(f"      Original size: {original_copy_size:.6f} (value: ${trade_value:.2f})")
                 print(f"      Scaled size: {copy_size:.6f} (target value: ${MIN_TRADE_VALUE_TARGET:.2f})")
         
@@ -525,10 +514,11 @@ class CopyTrader:
             copy_size = round(copy_size, 2)
         
         # Final verification: ensure we're still above $10 after rounding
+        # Scale up if needed instead of skipping
         if current_price > 0:
             final_trade_value = copy_size * current_price
             if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
-                # Rounding or price change brought us below minimum, scale up again with larger buffer
+                # Rounding or price change brought us below minimum, scale up again
                 copy_size = MIN_TRADE_VALUE_TARGET / current_price
                 if coin in ["BTC", "ETH"]:
                     copy_size = round(copy_size, 4)
@@ -539,9 +529,10 @@ class CopyTrader:
                 final_trade_value = copy_size * current_price
                 print(f"   ⚠️  Adjusted size after rounding to ensure $10 minimum: {copy_size:.6f} (value: ${final_trade_value:.2f})")
                 
-                # One more check - if still below, add a small buffer
+                # One more check - if still below after rounding, scale up again
+                final_trade_value = copy_size * current_price
                 if final_trade_value < MIN_TRADE_VALUE_REQUIRED:
-                    copy_size = (MIN_TRADE_VALUE_REQUIRED + 0.5) / current_price
+                    copy_size = MIN_TRADE_VALUE_TARGET / current_price
                     if coin in ["BTC", "ETH"]:
                         copy_size = round(copy_size, 4)
                     elif coin == "SOL":
@@ -615,9 +606,9 @@ class CopyTrader:
             # Get fresh price to account for any movement
             if current_price > 0:
                 final_check_value = copy_size * current_price
-                if final_check_value < 10.0:
+                if final_check_value < MIN_TRADE_VALUE_REQUIRED:
                     # One last adjustment to ensure we're above minimum
-                    copy_size = 10.5 / current_price
+                    copy_size = MIN_TRADE_VALUE_TARGET / current_price
                     if coin in ["BTC", "ETH"]:
                         copy_size = round(copy_size, 4)
                     elif coin == "SOL":
@@ -832,14 +823,23 @@ class CopyTrader:
         # Update last known positions
         self.last_positions = current_positions
         
-        # Print current status
+        # Print current status (only show allowed coins)
         if current_positions:
-            print("\n📈 Current positions being tracked:")
-            for coin, position in current_positions.items():
-                size = float(position.get("szi", 0))
-                entry_px = position.get("entryPx", "N/A")
-                pnl = position.get("unrealizedPnl", "0")
-                print(f"   {coin}: {size:+.4f} @ {entry_px} (PnL: {pnl})")
+            # Filter to only show allowed coins
+            filtered_positions = {
+                coin: position for coin, position in current_positions.items()
+                if self.allowed_coins is None or coin in self.allowed_coins
+            }
+            
+            if filtered_positions:
+                print("\n📈 Current positions being tracked:")
+                for coin, position in filtered_positions.items():
+                    size = float(position.get("szi", 0))
+                    entry_px = position.get("entryPx", "N/A")
+                    pnl = position.get("unrealizedPnl", "0")
+                    print(f"   {coin}: {size:+.4f} @ {entry_px} (PnL: {pnl})")
+            else:
+                print("   No tracked positions in allowed coins")
         else:
             print("   No open positions")
     
@@ -923,7 +923,7 @@ def main():
     # POSITION SIZE MULTIPLIER: Multiply the calculated copy percentage by this amount
     # 1.0 = no change, 1.5 = 50% larger positions, 2.0 = double position size, 0.5 = half position size
     # This allows you to scale positions up/down from the auto-calculated amount
-    POSITION_SIZE_MULTIPLIER = 100000.0  # Double the position size
+    POSITION_SIZE_MULTIPLIER = 2.0  # Double the position size
     
     # Check interval in seconds
     # Lower values = faster response time but more API requests
