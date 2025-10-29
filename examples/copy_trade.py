@@ -640,6 +640,11 @@ class CopyTrader:
                     print("\n⚠️  First check - recording current positions (won't copy existing positions)")
                     print("   Future changes will be copied...")
         
+        # Get my positions once on first check to verify we don't already have positions
+        my_positions_first_check = {}
+        if is_first_check:
+            my_positions_first_check = self.get_my_positions()
+        
         # Compare with previous positions
         for coin, position in current_positions.items():
             current_size = float(position.get("szi", 0))
@@ -647,6 +652,12 @@ class CopyTrader:
             
             # On first check, only copy if explicitly enabled or if similar conditions
             if is_first_check:
+                # ALWAYS check if we already have a position first - skip if we do
+                my_existing_size = my_positions_first_check.get(coin, 0)
+                if abs(my_existing_size) > 0.001:
+                    logging.info(f"Skipping existing position in {coin} (target: {current_size}, you already have: {my_existing_size})")
+                    continue
+                
                 if hasattr(self, 'copy_existing_positions') and self.copy_existing_positions:
                     logging.info(f"Copying existing position in {coin} (size: {current_size})")
                     prev_size_for_first = 0.0
@@ -807,8 +818,18 @@ class CopyTrader:
         consecutive_errors = 0
         max_consecutive_errors = 5
         
+        # Use a monotonic scheduler to maintain a steady cadence regardless of work duration
+        next_run = time.monotonic()
+        
         try:
             while True:
+                # Sleep until the next scheduled run time (handles drift)
+                now = time.monotonic()
+                sleep_for = next_run - now
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                iteration_start = time.monotonic()
+                
                 try:
                     self.monitor_positions()
                     consecutive_errors = 0  # Reset on successful check
@@ -820,10 +841,17 @@ class CopyTrader:
                         logging.critical(f"Too many consecutive errors. Exiting to prevent issues.")
                         raise
                     
-                    # Wait before retry
+                    # Backoff on error, then schedule next iteration from now + interval
                     time.sleep(10)
+                    next_run = time.monotonic() + interval
+                    continue
                 
-                time.sleep(interval)
+                # Log iteration duration at debug level to diagnose slowdowns
+                iteration_duration = time.monotonic() - iteration_start
+                logging.debug(f"Monitor iteration duration: {iteration_duration:.3f}s")
+                
+                # Schedule the next run while preserving cadence
+                next_run += interval
                 
         except KeyboardInterrupt:
             logging.info("\n\n🛑 Monitoring stopped by user")
