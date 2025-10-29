@@ -354,6 +354,83 @@ class CopyTrader:
             print("   or you can manually adjust positions now.")
         
         print("="*80 + "\n")
+        # Also log to file
+        logging.info("="*80)
+        logging.info("Position sync check completed")
+        if needs_sync:
+            logging.info("⚠️  Positions out of sync - bot will gradually adjust")
+        else:
+            logging.info("✅ All positions in sync")
+        logging.info("="*80)
+    
+    def log_sync_status(self):
+        """
+        Log the current sync status between target and our positions.
+        Called periodically during monitoring to track position alignment.
+        """
+        try:
+            target_positions = self.get_current_positions()
+            my_positions = self.get_my_positions()
+            
+            # If target has no positions, log that
+            if not target_positions:
+                if my_positions:
+                    logging.info(f"📊 Sync Status: Target has 0 positions, you have {len(my_positions)} position(s) to close")
+                else:
+                    logging.debug("📊 Sync Status: Both target and you have 0 positions - fully synced")
+                return
+            
+            sync_issues = []
+            in_sync_count = 0
+            
+            # Check each target position
+            for coin, position in target_positions.items():
+                target_size = float(position.get("szi", 0))
+                expected_size = target_size * self.copy_percentage
+                my_size = my_positions.get(coin, 0)
+                
+                size_diff = abs(expected_size - my_size)
+                size_diff_pct = (size_diff / abs(expected_size) * 100) if abs(expected_size) > 0.001 else 0
+                
+                # Consider synced if within 5% of expected
+                if abs(size_diff) <= abs(expected_size * 0.05) or size_diff_pct < 5:
+                    in_sync_count += 1
+                else:
+                    sync_issues.append({
+                        "coin": coin,
+                        "target": target_size,
+                        "expected": expected_size,
+                        "actual": my_size,
+                        "diff": size_diff,
+                        "diff_pct": size_diff_pct
+                    })
+            
+            # Check for positions we have that target doesn't
+            extra_positions = []
+            for coin in my_positions:
+                if coin not in target_positions:
+                    extra_positions.append({"coin": coin, "size": my_positions[coin]})
+            
+            # Log summary
+            total_target = len(target_positions)
+            total_mine = len(my_positions)
+            
+            if len(sync_issues) == 0 and len(extra_positions) == 0 and total_target == total_mine:
+                logging.info(f"✅ Sync Status: All {in_sync_count} position(s) in sync")
+            else:
+                logging.info(f"📊 Sync Status: {in_sync_count}/{total_target} in sync, {len(sync_issues)} need adjustment")
+                
+                # Log details of sync issues
+                for issue in sync_issues:
+                    logging.info(f"   ⚠️  {issue['coin']}: Expected {issue['expected']:+.4f}, have {issue['actual']:+.4f} "
+                               f"(diff: {issue['diff']:+.4f}, {issue['diff_pct']:.1f}%)")
+                
+                # Log extra positions
+                for extra in extra_positions:
+                    logging.info(f"   📌 {extra['coin']}: You have {extra['size']:+.4f} but target doesn't")
+                    
+        except Exception as e:
+            logging.warning(f"Error logging sync status: {e}")
     
     def place_copy_order(self, coin: str, current_size: float, prev_size: float):
         """
@@ -460,6 +537,9 @@ class CopyTrader:
                     required_margin = trade_value / self.max_leverage
                     # Add a 10% buffer for safety
                     margin_to_add = required_margin * 1.1
+                    # Round to 6 decimal places (USD precision) to avoid rounding errors
+                    # The API requires exact 6-decimal precision for USD amounts
+                    margin_to_add = round(margin_to_add, 6)
                     
                     try:
                         margin_result = self.exchange.update_isolated_margin(margin_to_add, coin)
@@ -511,6 +591,18 @@ class CopyTrader:
                 
                 # Adjust copy percentage after successful trade
                 self.adjust_copy_percentage()
+                
+                # Log sync improvement after trade
+                try:
+                    my_positions_after = self.get_my_positions()
+                    my_size_after = my_positions_after.get(coin, 0)
+                    expected_size = current_size * self.copy_percentage
+                    sync_diff = abs(expected_size - abs(my_size_after))
+                    sync_diff_pct = (sync_diff / abs(expected_size) * 100) if abs(expected_size) > 0.001 else 0
+                    logging.info(f"📊 Sync Update - {coin}: After trade, position is {sync_diff_pct:.1f}% off target "
+                               f"(target: {expected_size:+.4f}, actual: {my_size_after:+.4f})")
+                except Exception as e:
+                    logging.debug(f"Could not log sync update: {e}")
             else:
                 print(f"   ❌ Order failed: {result.get('response')}")
                 
@@ -676,6 +768,14 @@ class CopyTrader:
         
         # Update last known positions
         self.last_positions = current_positions
+        
+        # Log sync status periodically (every 10 checks to avoid spam)
+        if not hasattr(self, '_sync_check_counter'):
+            self._sync_check_counter = 0
+        self._sync_check_counter += 1
+        if self._sync_check_counter >= 10:
+            self.log_sync_status()
+            self._sync_check_counter = 0
         
         # Print current status
         if current_positions:
