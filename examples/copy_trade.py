@@ -62,7 +62,7 @@ def send_notification(title: str, message: str, sound: str = "default"):
 
 
 class CopyTrader:
-    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True, telegram_config: dict = None, use_isolated_margin: bool = True):
+    def __init__(self, target_wallet: str, copy_percentage: float = None, auto_calculate: bool = True, max_leverage: int = 10, enable_notifications: bool = True, telegram_config: dict = None, use_isolated_margin: bool = True, match_existing_if_similar: bool = True, price_deviation_threshold: float = 0.005, pnl_percent_threshold: float = 0.003):
         """
         Initialize the copy trader.
         
@@ -74,11 +74,17 @@ class CopyTrader:
             enable_notifications: Send macOS notifications on trades (default: True)
             telegram_config: Dict with 'bot_token' and 'chat_id' for Telegram notifications
             use_isolated_margin: Use isolated margin instead of cross margin (default: True)
+            match_existing_if_similar: If True, attempt to match existing positions on startup when conditions are similar
+            price_deviation_threshold: Max relative deviation between mid and entryPx to consider "similar" (e.g., 0.005 = 0.5%)
+            pnl_percent_threshold: Max |PnL%| relative to notional to consider "similar" (e.g., 0.003 = 0.3%)
         """
         self.target_wallet = target_wallet.lower()
         self.max_leverage = max_leverage
         self.enable_notifications = enable_notifications
         self.use_isolated_margin = use_isolated_margin
+        self.match_existing_if_similar = match_existing_if_similar
+        self.price_deviation_threshold = price_deviation_threshold
+        self.pnl_percent_threshold = pnl_percent_threshold
         
         # Setup Telegram notifier if configured
         self.telegram = None
@@ -173,6 +179,42 @@ class CopyTrader:
         
         self._startup_notified = True
     
+    def _should_match_existing_position(self, coin: str, position: Dict) -> bool:
+        """Decide if an existing target position should be matched on startup based on market similarity.
+
+        Conditions (any one passing is sufficient):
+        - Current mid is within price_deviation_threshold of target entryPx
+        - |unrealized PnL %| is within pnl_percent_threshold relative to entry notional
+        """
+        try:
+            entry_px = float(position.get("entryPx", 0) or 0)
+            szi = float(position.get("szi", 0) or 0)
+            unrealized_pnl = float(position.get("unrealizedPnl", 0) or 0)
+
+            # Fetch current mid price for coin
+            current_price = None
+            try:
+                coin_data = self.info.name_to_coin[coin]
+                mids = self.info.all_mids()
+                current_price = float(mids.get(coin_data, 0))
+            except Exception:
+                current_price = None
+
+            price_ok = False
+            if current_price and entry_px > 0:
+                rel_dev = abs(current_price - entry_px) / entry_px
+                price_ok = rel_dev <= self.price_deviation_threshold
+
+            pnl_ok = False
+            notional = abs(szi) * entry_px
+            if notional > 0:
+                pnl_pct = abs(unrealized_pnl) / notional
+                pnl_ok = pnl_pct <= self.pnl_percent_threshold
+
+            return bool(price_ok or pnl_ok)
+        except Exception:
+            return False
+
     def get_current_positions(self) -> Dict[str, Dict]:
         """Get current positions for the target wallet."""
         try:
@@ -332,12 +374,15 @@ class CopyTrader:
         copy_size = abs(size_diff) * self.copy_percentage
         is_buy = size_diff > 0
         
-        # If this is a SELL and you don't have a position, skip it
+        # If this is a SELL and you don't have a position, skip it unless opening/increasing a short
         if not is_buy:  # Selling
             my_positions = self.get_my_positions()
             my_position_size = my_positions.get(coin, 0)
-            
-            if abs(my_position_size) < 0.001:  # You don't have this position
+
+            # Determine whether target action is opening/increasing a short
+            opening_or_increasing_short = (current_size < 0 and prev_size <= 0 and abs(current_size) > abs(prev_size))
+
+            if abs(my_position_size) < 0.001 and not opening_or_increasing_short:
                 print(f"\n⏭️  Skipping SELL for {coin}: You don't have a position to sell")
                 logging.info(f"Skipping SELL order for {coin} - no position held")
                 return
@@ -497,25 +542,53 @@ class CopyTrader:
             if hasattr(self, 'copy_existing_positions') and self.copy_existing_positions:
                 print("\n📊 First check - will copy existing positions...")
             else:
-                print("\n⚠️  First check - recording current positions (won't copy existing positions)")
-                print("   Future changes will be copied...")
+                if self.match_existing_if_similar:
+                    print("\n🤝 First check - will copy existing positions IF market conditions are similar")
+                else:
+                    print("\n⚠️  First check - recording current positions (won't copy existing positions)")
+                    print("   Future changes will be copied...")
         
         # Compare with previous positions
         for coin, position in current_positions.items():
             current_size = float(position.get("szi", 0))
             prev_size = float(self.last_positions.get(coin, {}).get("szi", 0))
             
-            # On first check, only copy if explicitly enabled
+            # On first check, only copy if explicitly enabled or if similar conditions
             if is_first_check:
                 if hasattr(self, 'copy_existing_positions') and self.copy_existing_positions:
                     logging.info(f"Copying existing position in {coin} (size: {current_size})")
+                    prev_size_for_first = 0.0
+                elif self.match_existing_if_similar and self._should_match_existing_position(coin, position):
+                    logging.info(f"Matching existing position in {coin} due to similar conditions (size: {current_size})")
+                    prev_size_for_first = 0.0
                 else:
                     logging.info(f"Skipping existing position in {coin} (size: {current_size})")
                     continue
             
             # Check if position changed
-            if abs(current_size - prev_size) > 0.01:
-                self.place_copy_order(coin, current_size, prev_size)
+            if is_first_check:
+                # Use prev_size_for_first to open equivalent position from zero when applicable
+                if abs(current_size - prev_size_for_first) > 0.01:
+                    self.place_copy_order(coin, current_size, prev_size_for_first)
+            else:
+                # No delta, but consider late matching if conditions become similar and we hold no position
+                if self.match_existing_if_similar:
+                    try:
+                        my_positions_now = self.get_my_positions()
+                        my_sz_now = float(my_positions_now.get(coin, 0))
+                    except Exception:
+                        my_sz_now = 0.0
+
+                    no_change = abs(current_size - prev_size) <= 0.01
+                    if abs(my_sz_now) < 0.001 and abs(current_size) > 0.01 and no_change:
+                        if self._should_match_existing_position(coin, position):
+                            logging.info(f"Matching {coin} later due to similar conditions (size: {current_size})")
+                            self.place_copy_order(coin, current_size, 0.0)
+                            # After placing, skip delta handling for this coin in this cycle
+                            continue
+
+                if abs(current_size - prev_size) > 0.01:
+                    self.place_copy_order(coin, current_size, prev_size)
         
         # Handle positions that were closed or reduced
         for coin in self.last_positions:
@@ -723,6 +796,13 @@ def main():
     # False = Skip existing positions, only copy NEW trades
     COPY_EXISTING_POSITIONS = False
     
+    # Match existing positions if market conditions are similar (price/PnL near entry)
+    MATCH_EXISTING_IF_SIMILAR = True
+    # Consider similar if mid price within 0.5% of entry
+    PRICE_DEVIATION_THRESHOLD = 0.005
+    # Or if |PnL%| relative to notional is within 0.3%
+    PNL_PERCENT_THRESHOLD = 0.003
+
     # Sync positions on startup - ensures bot aligns with target after restart
     # True  = Check if positions are aligned and report
     # False = Don't check positions on startup
@@ -751,7 +831,10 @@ def main():
         max_leverage=10,
         enable_notifications=ENABLE_NOTIFICATIONS,
         telegram_config=telegram_config,
-        use_isolated_margin=USE_ISOLATED_MARGIN
+        use_isolated_margin=USE_ISOLATED_MARGIN,
+        match_existing_if_similar=MATCH_EXISTING_IF_SIMILAR,
+        price_deviation_threshold=PRICE_DEVIATION_THRESHOLD,
+        pnl_percent_threshold=PNL_PERCENT_THRESHOLD
     )
     
     # Set whether to copy existing positions
