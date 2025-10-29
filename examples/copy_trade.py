@@ -338,12 +338,18 @@ class CopyTrader:
         # Calculate the size change
         size_diff = current_size - prev_size
         
+        # Debug logging for short detection
+        logging.debug(f"place_copy_order({coin}): prev_size={prev_size}, current_size={current_size}, size_diff={size_diff}")
+        
         if abs(size_diff) < 0.0001:  # Ignore very small changes
             return
         
         # Apply copy percentage
         copy_size = abs(size_diff) * self.copy_percentage
         is_buy = size_diff > 0
+        
+        # Debug: Log whether we're detecting a buy or sell
+        logging.info(f"Trade detected for {coin}: size_diff={size_diff:+.6f}, is_buy={is_buy}, copy_size={copy_size:.6f}")
         
         # Handle SELL orders
         # If we already have a position → reduce using market_close
@@ -367,7 +373,9 @@ class CopyTrader:
             MIN_TRADE_VALUE_REQUIRED = 10.0
 
             # If we do NOT have a position, this SELL should open a short
+            logging.info(f"Target selling for {coin}: my_position_size={my_position_size}, abs={abs(my_position_size)}")
             if abs(my_position_size) < 0.001:
+                logging.info(f"Opening new short for {coin} (no existing position)")
                 # Scale to meet minimum notional if needed
                 if current_price > 0:
                     trade_value = copy_size * current_price
@@ -402,8 +410,44 @@ class CopyTrader:
                 print(f"\n📊 Target opening/increasing short for {coin}:")
                 print(f"   Target change: {size_diff:+.4f}")
                 print(f"   Opening short size: {copy_size:.4f}")
+                
+                # Calculate trade value
+                trade_value = 0
                 if current_price > 0:
-                    print(f"   Trade value: ${(copy_size * current_price):,.2f}")
+                    trade_value = copy_size * current_price
+                    print(f"   Trade value: ${trade_value:,.2f}")
+                
+                # Configure isolated margin if enabled (same as for longs)
+                if self.use_isolated_margin:
+                    print(f"   Setting isolated margin mode for {coin}...")
+                    # Set leverage to isolated mode (is_cross=False means isolated)
+                    try:
+                        leverage_result = self.exchange.update_leverage(self.max_leverage, coin, is_cross=False)
+                        if leverage_result.get("status") == "ok":
+                            print(f"   ✅ Leverage set to {self.max_leverage}x (isolated)")
+                        else:
+                            logging.warning(f"Could not set leverage for {coin}: {leverage_result}")
+                    except Exception as e:
+                        logging.warning(f"Error setting leverage for {coin}: {e}")
+                    
+                    # Calculate and add isolated margin for the short position
+                    if current_price > 0 and trade_value > 0:
+                        # For isolated margin, we need to fund the position
+                        # The margin needed = position value / leverage
+                        required_margin = trade_value / self.max_leverage
+                        # Add a 10% buffer for safety
+                        margin_to_add = required_margin * 1.1
+                        # Round to 6 decimal places (USD precision) to avoid rounding errors
+                        margin_to_add = round(margin_to_add, 6)
+                        
+                        try:
+                            margin_result = self.exchange.update_isolated_margin(margin_to_add, coin)
+                            if margin_result.get("status") == "ok":
+                                print(f"   ✅ Added ${margin_to_add:,.2f} isolated margin")
+                            else:
+                                logging.warning(f"Could not add isolated margin for {coin}: {margin_result}")
+                        except Exception as e:
+                            logging.warning(f"Error adding isolated margin for {coin}: {e}")
 
                 try:
                     # Place aggressive sell (short open)
@@ -440,15 +484,34 @@ class CopyTrader:
                         if order_filled:
                             print(f"   ✅ Short opened successfully!")
                             print(f"   Filled size: {filled_size:.4f} @ ${executed_price:,.2f}")
+                            
+                            # Send Telegram notification for successful short open
+                            if self.telegram:
+                                trade_value = filled_size * executed_price if executed_price > 0 else trade_value
+                                self.telegram.notify_trade_executed(coin, "SELL", filled_size, trade_value, executed_price)
+                            
                             self.adjust_copy_percentage()
                         else:
                             print(f"   ⚠️  Short order placed but not filled (IOC expired)")
+                            
+                            # Send Telegram notification for failed short
+                            if self.telegram:
+                                self.telegram.notify_trade_failed(coin, "SELL", "IOC order expired - no fill")
                     else:
                         print(f"   ❌ Short open failed: {result.get('response')}")
                         logging.warning(f"Failed to open short for {coin}: {result}")
+                        
+                        # Send Telegram notification for failed short
+                        if self.telegram:
+                            error_msg = str(result.get('response', 'Unknown error'))
+                            self.telegram.notify_trade_failed(coin, "SELL", error_msg)
                 except Exception as e:
                     print(f"   ❌ Error opening short: {e}")
                     logging.error(f"Error opening short for {coin}: {e}")
+                    
+                    # Send Telegram notification for error
+                    if self.telegram:
+                        self.telegram.notify_trade_failed(coin, "SELL", str(e))
 
                 return  # Done handling short open
             
@@ -813,8 +876,10 @@ class CopyTrader:
                     logging.info(f"Skipping existing position in {coin} (size: {current_size})")
                     continue
             
-            # Check if position changed
-            if abs(current_size - prev_size) > 0.01:
+            # Check if position changed (including direction changes from long to short or vice versa)
+            size_change = abs(current_size - prev_size)
+            if size_change > 0.01:
+                logging.info(f"Position change detected for {coin}: {prev_size} -> {current_size} (change: {current_size - prev_size:+.6f})")
                 self.place_copy_order(coin, current_size, prev_size)
         
         # Handle positions that were closed or reduced
